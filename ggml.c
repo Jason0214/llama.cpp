@@ -148,6 +148,10 @@ inline static void* ggml_aligned_malloc(size_t size) {
 #include "ggml-opencl.h"
 #endif
 
+#if defined(GGML_USE_VULKAN)
+#include "ggml-vk.h"
+#endif
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -3923,6 +3927,8 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
 
 #if defined(GGML_USE_CUBLAS)
         ggml_init_cublas();
+#elif defined(GGML_USE_VULKAN)
+        ggml_init_vulkan();
 #elif defined(GGML_USE_CLBLAST)
         ggml_cl_init();
 #endif
@@ -15656,7 +15662,7 @@ int ggml_cpu_has_wasm_simd(void) {
 }
 
 int ggml_cpu_has_blas(void) {
-#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_CLBLAST)
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_CLBLAST) || defined(GGML_USE_VULKAN)
     return 1;
 #else
     return 0;
@@ -15665,6 +15671,14 @@ int ggml_cpu_has_blas(void) {
 
 int ggml_cpu_has_cublas(void) {
 #if defined(GGML_USE_CUBLAS)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_vulkan(void) {
+#if defined(GGML_USE_VULKAN)
     return 1;
 #else
     return 0;
@@ -15680,7 +15694,7 @@ int ggml_cpu_has_clblast(void) {
 }
 
 int ggml_cpu_has_gpublas(void) {
-    return ggml_cpu_has_cublas() || ggml_cpu_has_clblast();
+    return ggml_cpu_has_cublas() || ggml_cpu_has_clblast() || ggml_cpu_has_vulkan();
 }
 
 int ggml_cpu_has_sse3(void) {

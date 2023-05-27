@@ -69,6 +69,7 @@ option(LLAMA_BLAS                   "llama: use BLAS"                           
 option(LLAMA_BLAS_VENDOR            "llama: BLA_VENDOR from https://cmake.org/cmake/help/latest/module/FindBLAS.html#blas-lapack-vendors" Generic)
 option(LLAMA_CUBLAS                 "llama: use cuBLAS"                                     OFF)
 option(LLAMA_CLBLAST                "llama: use CLBlast"                                    OFF)
+option(LLAMA_VULKAN                 "llama: use Vulkan"                                     OFF)
 
 option(LLAMA_BUILD_TESTS            "llama: build tests"    ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES         "llama: build examples" ${LLAMA_STANDALONE})
@@ -209,6 +210,22 @@ if (LLAMA_CLBLAST)
     else()
         message(WARNING "CLBlast not found")
     endif()
+endif()
+
+if (LLAMA_VULKAN)
+    find_package(Vulkan REQUIRED)
+    set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ${Vulkan_LIBRARY})
+    include_directories(${Vulkan_INCLUDE_DIRS})
+
+    # if (APPLE)
+    #     if (NOT Vulkan_MoltenVK_FOUND)
+    #         message(FATAL_ERROR "MoltenVK not found! Required for using Vulkan on Apple OSes!")
+    #     endif()
+    #     set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ${Vulkan_MoltenVK_LIBRARY})
+    # endif()
+
+    set(GGML_VULKAN_SOURCES ggml-vk.cpp ggml-vk.h)
+    add_compile_definitions(GGML_USE_VULKAN)
 endif()
 
 if (LLAMA_ALL_WARNINGS)
@@ -367,7 +384,8 @@ add_library(ggml OBJECT
             ggml.c
             ggml.h
             ${GGML_CUDA_SOURCES}
-            ${GGML_OPENCL_SOURCES})
+            ${GGML_OPENCL_SOURCES}
+            ${GGML_VULKAN_SOURCES})
 
 target_include_directories(ggml PUBLIC .)
 target_compile_features(ggml PUBLIC c_std_11) # don't bump
