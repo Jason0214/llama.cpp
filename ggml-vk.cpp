@@ -212,8 +212,8 @@ gpu_select_done:
             throw std::runtime_error("Fail to find a compute capable queue on the selected gpu!\n");
         }
 
-        // TODO: using a single queue or multiple queu may be workload dependent and device dependent.
-        // For now prefer single queue.
+        // TODO: Performance choises, using a single queue or multiple queues?
+        // It may be workload dependent and device dependent. Prefer single queue for now.
         if (queue_families[compute_queue_idx].queueFlags & vk::QueueFlagBits::eTransfer) {
             transfer_queue_idx = compute_queue_idx;
             is_same_queue = true;
