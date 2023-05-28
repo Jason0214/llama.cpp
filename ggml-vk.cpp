@@ -14,8 +14,8 @@
 #define ARRAY_LEN(x) sizeof(x) / sizeof(x[0])
 
 static vk::Instance       inst   = {};
-static vk::Device         device = {};
 static vk::PhysicalDevice gpu    = {};
+static vk::Device         device = {};
 
 static vk::PhysicalDeviceProperties gpu_props = {};
 static vk::PhysicalDeviceMemoryProperties gpu_mem_props = {};
@@ -187,4 +187,40 @@ gpu_select_done:
             transfer_queue_idx, vk::to_string(queue_families[transfer_queue_idx].queueFlags).c_str());
     }
 
+    {
+        constexpr uint32_t queue_count = 1;
+        const float queue_priorities[queue_count] = { 1.0f };
+
+        vk::DeviceQueueCreateInfo queues[] = {
+            vk::DeviceQueueCreateInfo()
+                .setQueueFamilyIndex(compute_queue_idx)
+                .setQueueCount(queue_count)
+                .setPQueuePriorities(queue_priorities),
+            vk::DeviceQueueCreateInfo()
+                .setQueueFamilyIndex(transfer_queue_idx)
+                .setQueueCount(queue_count)
+                .setPQueuePriorities(queue_priorities),
+        };
+        uint32_t queue_family_count = ARRAY_LEN(queues);
+        if (is_same_queue) {
+            queue_family_count = 1;
+        }
+
+        constexpr uint32_t device_ext_count = 0;
+        const auto device_info =
+            vk::DeviceCreateInfo()
+                .setQueueCreateInfoCount(queue_family_count)
+                .setPQueueCreateInfos(queues)
+                // No required device layers.
+                .setEnabledLayerCount(0)
+                .setPpEnabledLayerNames(nullptr)
+                // No required device extensions.
+                .setEnabledExtensionCount(0)
+                .setPpEnabledExtensionNames(nullptr)
+                // No required features.
+                .setPEnabledFeatures(nullptr);
+
+        result = gpu.createDevice(&device_info, nullptr, &device);
+        GGML_ASSERT(result == vk::Result::eSuccess);
+    }
 }
