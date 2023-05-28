@@ -1107,6 +1107,7 @@ extern "C" {
     GGML_API int ggml_cpu_has_gpublas    (void);
     GGML_API int ggml_cpu_has_sse3       (void);
     GGML_API int ggml_cpu_has_vsx        (void);
+    GGML_API int ggml_cpu_has_vulkan     (void);
 
     //
     // Internal types and functions exposed for tests and benchmarks

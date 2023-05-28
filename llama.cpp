@@ -2987,6 +2987,7 @@ const char * llama_print_system_info(void) {
     s += "BLAS = "        + std::to_string(ggml_cpu_has_blas())        + " | ";
     s += "SSE3 = "        + std::to_string(ggml_cpu_has_sse3())        + " | ";
     s += "VSX = "         + std::to_string(ggml_cpu_has_vsx())         + " | ";
+    s += "Vulkan = "      + std::to_string(ggml_cpu_has_vulkan())      + " | ";
 
     return s.c_str();
 }
