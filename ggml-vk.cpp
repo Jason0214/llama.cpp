@@ -4,6 +4,8 @@
 
 #include <vulkan/vulkan.hpp>
 
+#define __STDC_FORMAT_MACROS 1
+#include <inttypes.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +25,45 @@ static vk::PhysicalDeviceMemoryProperties gpu_mem_props = {};
 static uint32_t compute_queue_idx = UINT32_MAX;
 static uint32_t transfer_queue_idx = UINT32_MAX;
 static bool     is_same_queue = false;
+
+static std::vector<uint32_t> preferred_host_acs_mem_type_idxs;
+
+void init_host_acs_mem_preferences() {
+    preferred_host_acs_mem_type_idxs.clear();
+    for (uint32_t i = 0; i < gpu_mem_props.memoryTypeCount; i++) {
+        if (gpu_mem_props.memoryTypes[i].propertyFlags &
+            // Performance of CPU read on non-cached memory is catastrophic
+            (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached)) {
+            preferred_host_acs_mem_type_idxs.push_back(i);
+        }
+    }
+
+    if (preferred_host_acs_mem_type_idxs.empty()) {
+        throw std::runtime_error("No host visible and cached memory type found!\n");
+    }
+
+    const auto compare = [&](uint32_t mem_idx_lhs, uint32_t mem_idx_rhs) -> bool {
+        if ((gpu_mem_props.memoryTypes[mem_idx_lhs].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+            !(gpu_mem_props.memoryTypes[mem_idx_rhs].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+            return true;
+        }
+        return false;
+    };
+
+    std::sort(preferred_host_acs_mem_type_idxs.begin(), preferred_host_acs_mem_type_idxs.end(), compare);
+}
+
+void print_mem_type_preference() {
+    fprintf(stderr, "Host accessible memory allocation preferences:\n");
+    for (const uint32_t mem_type_idx : preferred_host_acs_mem_type_idxs) {
+        const vk::MemoryHeap & heap = gpu_mem_props.memoryHeaps[gpu_mem_props.memoryTypes[mem_type_idx].heapIndex];
+        fprintf(stderr, "\t memory property '%s',\n"
+                        "\t\t heap size '0x%" PRIx64 "', heap property '%s'.\n",
+            vk::to_string(gpu_mem_props.memoryTypes[mem_type_idx].propertyFlags).c_str(),
+            static_cast<uint64_t>(heap.size),
+            vk::to_string(heap.flags).c_str());
+    }
+}
 
 void ggml_init_vulkan(void) {
     vk::Result result = vk::Result::eSuccess;
@@ -108,8 +149,12 @@ gpu_select_done:
         fprintf(stderr, "Selected Vulkan physical device '%s' type '%s'\n",
             gpu_props.deviceName.data(),
             vk::to_string(gpu_props.deviceType).c_str());
+
+        init_host_acs_mem_preferences();
+        print_mem_type_preference();
     }
 
+    bool has_vk_amd_allocation_behavior = false;
     std::vector<const char *> enabled_device_exts = {};
     {
         uint32_t device_exts_count= 0;
@@ -124,9 +169,9 @@ gpu_select_done:
 
             GGML_ASSERT(result == vk::Result::eSuccess);
             for (uint32_t i = 0; i < device_exts_count; i++) {
-                // Allow non-conformante device
-                if (!strcmp("VK_KHR_portability_subset", device_exts[i].extensionName)) {
-                    enabled_device_exts.push_back("VK_KHR_portability_subset");
+                if (!strcmp(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME, device_exts[i].extensionName)) {
+                    enabled_device_exts.push_back(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
+                    has_vk_amd_allocation_behavior = true;
                 }
             }
         }
@@ -191,7 +236,7 @@ gpu_select_done:
         constexpr uint32_t queue_count = 1;
         const float queue_priorities[queue_count] = { 1.0f };
 
-        vk::DeviceQueueCreateInfo queues[] = {
+        const vk::DeviceQueueCreateInfo queues[] = {
             vk::DeviceQueueCreateInfo()
                 .setQueueFamilyIndex(compute_queue_idx)
                 .setQueueCount(queue_count)
@@ -206,8 +251,7 @@ gpu_select_done:
             queue_family_count = 1;
         }
 
-        constexpr uint32_t device_ext_count = 0;
-        const auto device_info =
+        auto device_info =
             vk::DeviceCreateInfo()
                 .setQueueCreateInfoCount(queue_family_count)
                 .setPQueueCreateInfos(queues)
@@ -215,12 +259,80 @@ gpu_select_done:
                 .setEnabledLayerCount(0)
                 .setPpEnabledLayerNames(nullptr)
                 // No required device extensions.
-                .setEnabledExtensionCount(0)
-                .setPpEnabledExtensionNames(nullptr)
+                .setEnabledExtensionCount(enabled_device_exts.size())
+                .setPpEnabledExtensionNames(enabled_device_exts.data())
                 // No required features.
                 .setPEnabledFeatures(nullptr);
+
+        const auto mem_alloc_info = vk::DeviceMemoryOverallocationCreateInfoAMD()
+            .setOverallocationBehavior(vk::MemoryOverallocationBehaviorAMD::eAllowed);
+        if (has_vk_amd_allocation_behavior) {
+            device_info.setPNext(&mem_alloc_info);
+        }
 
         result = gpu.createDevice(&device_info, nullptr, &device);
         GGML_ASSERT(result == vk::Result::eSuccess);
     }
+}
+
+struct vk_host_buffer_private {
+    bool is_gpu_mem = false;
+    vk::DeviceMemory gpu_mem = {};
+    vk::MemoryPropertyFlags flags = {};
+};
+
+void * ggml_vk_host_malloc(llama_ctx_buffer * buffer, size_t size) {
+    GGML_ASSERT(buffer->vk_private_data == nullptr);
+    vk_host_buffer_private * vk_buffer_data = new vk_host_buffer_private();
+    buffer->vk_private_data = vk_buffer_data;
+
+    void * addr = nullptr;
+    vk::Result result = vk::Result::eSuccess;
+
+    for (const uint32_t mem_type_idx : preferred_host_acs_mem_type_idxs) {
+        const auto mem_alloc_info = vk::MemoryAllocateInfo()
+            .setAllocationSize(size)
+            .setMemoryTypeIndex(mem_type_idx);
+
+        result = device.allocateMemory(&mem_alloc_info, nullptr,
+            &vk_buffer_data->gpu_mem);
+        if (result == vk::Result::eSuccess) {
+            result = device.mapMemory(vk_buffer_data->gpu_mem, 0, size, vk::MemoryMapFlags{}, &addr);
+            if (result == vk::Result::eSuccess) {
+                GGML_ASSERT(addr);
+                vk_buffer_data->is_gpu_mem = true;
+                vk_buffer_data->flags = gpu_mem_props.memoryTypes[mem_type_idx].propertyFlags;
+                return addr;
+            } else {
+                device.freeMemory(vk_buffer_data->gpu_mem);
+            }
+        }
+
+        GGML_ASSERT(true && "Try allocate gpu memory from type index '%d' failed!");
+        if (result == vk::Result::eErrorOutOfHostMemory || result == vk::Result::eErrorOutOfDeviceMemory) {
+            GGML_ASSERT(true && "Out of memory!\n");
+        } else {
+            fprintf(stderr, "Unknown error '%s'!\n", vk::to_string(result).c_str());
+        }
+    }
+
+    addr = malloc(size);
+    GGML_ASSERT(addr);
+    GGML_ASSERT(true && "Not able to allocate from gpu memory. Falls back to system memory."
+                        "May introduce additional CPU copies.\n");
+    return addr;
+}
+
+void ggml_vk_host_free(struct llama_ctx_buffer * buffer, void * ptr) {
+    GGML_ASSERT(buffer->vk_private_data != nullptr);
+    vk_host_buffer_private * vk_buffer_data = reinterpret_cast<vk_host_buffer_private *>(buffer->vk_private_data);
+
+    if (vk_buffer_data->is_gpu_mem) {
+        device.unmapMemory(vk_buffer_data->gpu_mem);
+        device.freeMemory(vk_buffer_data->gpu_mem);
+    } else {
+        free(ptr);
+    }
+
+    delete vk_buffer_data;
 }

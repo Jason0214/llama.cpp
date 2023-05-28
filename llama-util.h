@@ -467,7 +467,7 @@ struct llama_ctx_buffer {
     llama_ctx_buffer& operator=(const llama_ctx_buffer&) = delete;
     llama_ctx_buffer& operator=(llama_ctx_buffer&&) = delete;
 };
-#elif defined(GGLML_USE_VULKAN)
+#elif defined(GGML_USE_VULKAN)
 struct llama_ctx_buffer;
 
 void * ggml_vk_host_malloc(struct llama_ctx_buffer * buffer, size_t size);
