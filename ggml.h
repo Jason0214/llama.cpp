@@ -200,6 +200,12 @@
 #define GGML_MAX_OPT           4
 #define GGML_DEFAULT_N_THREADS 4
 
+#if UINTPTR_MAX == 0xFFFFFFFF
+    #define GGML_MEM_ALIGN 4
+#else
+    #define GGML_MEM_ALIGN 16
+#endif
+
 #define GGML_ASSERT(x) \
     do { \
         if (!(x)) { \

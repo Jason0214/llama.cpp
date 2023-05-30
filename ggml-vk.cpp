@@ -1,6 +1,6 @@
 #include "ggml-vk.h"
 #include "llama.h"
-#include "llama-util.h"
+#include "ggml.h"
 
 #include <vulkan/vulkan.hpp>
 
@@ -275,64 +275,105 @@ gpu_select_done:
     }
 }
 
-struct vk_host_buffer_private {
+struct alignas(GGML_MEM_ALIGN) vk_host_buffer_private {
+    const uint64_t magic = 0xdeadbeef;
     bool is_gpu_mem = false;
-    vk::DeviceMemory gpu_mem = {};
     vk::MemoryPropertyFlags flags = {};
+    vk::DeviceMemory gpu_mem = {};
+    uint32_t data_offset = 0;
 };
 
-void * ggml_vk_host_malloc(llama_ctx_buffer * buffer, size_t size) {
-    GGML_ASSERT(buffer->vk_private_data == nullptr);
-    vk_host_buffer_private * vk_buffer_data = new vk_host_buffer_private();
-    buffer->vk_private_data = vk_buffer_data;
+static inline size_t calc_alloc_size(const size_t requested_size) {
+    return requested_size + sizeof(vk_host_buffer_private) + static_cast<size_t>(GGML_MEM_ALIGN - 1);
+}
+
+static inline vk_host_buffer_private * get_vk_private(void * data_ptr) {
+    return reinterpret_cast<vk_host_buffer_private *>(reinterpret_cast<uintptr_t>(data_ptr) - sizeof(vk_host_buffer_private));
+}
+
+static inline void * get_data_addr(vk_host_buffer_private * vk_private) {
+    return reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(vk_private) + sizeof(vk_host_buffer_private));
+}
+
+void * ggml_vk_host_malloc(size_t size) {
+    size = calc_alloc_size(size);
 
     void * addr = nullptr;
     vk::Result result = vk::Result::eSuccess;
 
+    vk::DeviceMemory gpu_mem = {};
+    vk::MemoryPropertyFlags gpu_mem_flags = {};
     for (const uint32_t mem_type_idx : preferred_host_acs_mem_type_idxs) {
         const auto mem_alloc_info = vk::MemoryAllocateInfo()
             .setAllocationSize(size)
             .setMemoryTypeIndex(mem_type_idx);
 
-        result = device.allocateMemory(&mem_alloc_info, nullptr,
-            &vk_buffer_data->gpu_mem);
+        result = device.allocateMemory(&mem_alloc_info, nullptr, &gpu_mem);
         if (result == vk::Result::eSuccess) {
-            result = device.mapMemory(vk_buffer_data->gpu_mem, 0, size, vk::MemoryMapFlags{}, &addr);
+            result = device.mapMemory(gpu_mem, 0, size, vk::MemoryMapFlags{}, &addr);
             if (result == vk::Result::eSuccess) {
                 GGML_ASSERT(addr);
-                vk_buffer_data->is_gpu_mem = true;
-                vk_buffer_data->flags = gpu_mem_props.memoryTypes[mem_type_idx].propertyFlags;
-                return addr;
+                gpu_mem_flags = gpu_mem_props.memoryTypes[mem_type_idx].propertyFlags;
+                break;
             } else {
-                device.freeMemory(vk_buffer_data->gpu_mem);
+                device.freeMemory(gpu_mem);
+                gpu_mem = vk::DeviceMemory{};
             }
         }
 
-        GGML_ASSERT(true && "Try allocate gpu memory from type index '%d' failed!");
+        fprintf(stderr, "Try allocate gpu memory from type index '%d' failed!\n", mem_type_idx);
         if (result == vk::Result::eErrorOutOfHostMemory || result == vk::Result::eErrorOutOfDeviceMemory) {
-            GGML_ASSERT(true && "Out of memory!\n");
+            fprintf(stderr, "Out of device memory!\n");
         } else {
             fprintf(stderr, "Unknown error '%s'!\n", vk::to_string(result).c_str());
         }
     }
 
-    addr = malloc(size);
-    GGML_ASSERT(addr);
-    GGML_ASSERT(true && "Not able to allocate from gpu memory. Falls back to system memory."
+    if (!addr) {
+        fprintf(stderr, "Not able to allocate from gpu memory. Falls back to system memory."
                         "May introduce additional CPU copies.\n");
-    return addr;
-}
-
-void ggml_vk_host_free(struct llama_ctx_buffer * buffer, void * ptr) {
-    GGML_ASSERT(buffer->vk_private_data != nullptr);
-    vk_host_buffer_private * vk_buffer_data = reinterpret_cast<vk_host_buffer_private *>(buffer->vk_private_data);
-
-    if (vk_buffer_data->is_gpu_mem) {
-        device.unmapMemory(vk_buffer_data->gpu_mem);
-        device.freeMemory(vk_buffer_data->gpu_mem);
-    } else {
-        free(ptr);
+        addr = malloc(size);
+        GGML_ASSERT(addr);
+        if (!addr) {
+            // Out of memory
+            return nullptr;
+        }
     }
 
-    delete vk_buffer_data;
+    constexpr uintptr_t align_mask = GGML_MEM_ALIGN - 1u;
+    void * aligned_addr = reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(addr) + align_mask) & ~align_mask);
+    vk_host_buffer_private * vk_private = new (aligned_addr) vk_host_buffer_private;
+    vk_private->is_gpu_mem = gpu_mem != vk::DeviceMemory{};
+    vk_private->flags = gpu_mem_flags;
+    vk_private->gpu_mem = gpu_mem;
+    vk_private->data_offset = reinterpret_cast<uintptr_t>(get_data_addr(vk_private)) - reinterpret_cast<uintptr_t>(aligned_addr);
+
+    return get_data_addr(vk_private);
+}
+
+void ggml_vk_host_free(void * ptr) {
+    if (ptr) {
+        vk_host_buffer_private * vk_private = get_vk_private(ptr);
+
+        GGML_ASSERT(vk_private->magic == 0xdeadbeaf);
+
+        if (vk_private->is_gpu_mem) {
+            device.unmapMemory(vk_private->gpu_mem);
+            device.freeMemory(vk_private->gpu_mem);
+        } else {
+            free(reinterpret_cast<uint8_t*>(ptr) - vk_private->data_offset);
+        }
+    }
+}
+
+bool ggml_vk_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst) {
+    return false;
+}
+
+size_t ggml_vk_mul_mat_get_wsize(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst) {
+    return 0;
+}
+
+void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst, void * wdata, size_t wsize) {
+    return ;
 }

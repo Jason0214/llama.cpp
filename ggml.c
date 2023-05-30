@@ -109,12 +109,6 @@ typedef void* thread_ret_t;
 //#define GGML_SOFT_MAX_ACCELERATE
 #endif
 
-#if UINTPTR_MAX == 0xFFFFFFFF
-    #define GGML_MEM_ALIGN 4
-#else
-    #define GGML_MEM_ALIGN 16
-#endif
-
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #define GGML_ALIGNED_MALLOC(size)  _aligned_malloc(size, GGML_MEM_ALIGN)
 #define GGML_ALIGNED_FREE(ptr)     _aligned_free(ptr)
@@ -9544,6 +9538,15 @@ static void ggml_compute_forward_mul_mat_f32(
     }
 #endif
 
+#if defined(GGML_USE_VULKAN)
+    if (ggml_vk_can_mul_mat(src0, src1, dst)) {
+        if (params->ith == 0 && params->type == GGML_TASK_COMPUTE) {
+            ggml_vk_mul_mat(src0, src1, dst, params->wdata, params->wsize);
+        }
+        return;
+    }
+#endif
+
 #if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CLBLAST)
     if (ggml_compute_forward_mul_mat_use_blas(src0, src1, dst)) {
         if (params->ith != 0) {
@@ -14169,6 +14172,12 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                             node->n_tasks = 1; // TODO: this actually is doing nothing
                                                 //       the threads are still spinning
                             cur = ggml_cuda_mul_mat_get_wsize(node->src0, node->src1, node);
+                        }
+                        else
+#elif defined(GGML_USE_VULKAN)
+                        if (ggml_vk_can_mul_mat(node->src0, node->src1, node)) {
+                            node->n_tasks = 1;
+                            cur = ggml_vk_mul_mat_get_wsize(node->src0, node->src1, node);
                         }
                         else
 #endif

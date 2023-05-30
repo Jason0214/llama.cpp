@@ -468,26 +468,21 @@ struct llama_ctx_buffer {
     llama_ctx_buffer& operator=(llama_ctx_buffer&&) = delete;
 };
 #elif defined(GGML_USE_VULKAN)
-struct llama_ctx_buffer;
-
-void * ggml_vk_host_malloc(struct llama_ctx_buffer * buffer, size_t size);
-void   ggml_vk_host_free(struct llama_ctx_buffer * buffer, void * ptr);
-
+#include "ggml-vk.h"
 struct llama_ctx_buffer {
     uint8_t * addr = NULL;
     size_t size = 0;
-    void * vk_private_data = NULL;
 
     llama_ctx_buffer() = default;
 
     void resize(size_t size) {
-        addr = (uint8_t *) ggml_vk_host_malloc(this, size);
+        addr = (uint8_t *) ggml_vk_host_malloc(size);
         this->size = size;
     }
 
     void free() {
         if (addr) {
-            ggml_vk_host_free(this, addr);
+            ggml_vk_host_free(addr);
             addr = NULL;
         }
         size = 0;
