@@ -282,13 +282,16 @@ struct alignas(GGML_MEM_ALIGN) vk_host_buffer_private {
     vk::DeviceMemory gpu_mem = {};
     uint32_t data_offset = 0;
 };
+static_assert(sizeof(vk_host_buffer_private) % GGML_MEM_ALIGN == 0, "");
 
 static inline size_t calc_alloc_size(const size_t requested_size) {
     return requested_size + sizeof(vk_host_buffer_private) + static_cast<size_t>(GGML_MEM_ALIGN - 1);
 }
 
 static inline vk_host_buffer_private * get_vk_private(void * data_ptr) {
-    return reinterpret_cast<vk_host_buffer_private *>(reinterpret_cast<uintptr_t>(data_ptr) - sizeof(vk_host_buffer_private));
+    vk_host_buffer_private * ret = reinterpret_cast<vk_host_buffer_private *>(reinterpret_cast<uintptr_t>(data_ptr) - sizeof(vk_host_buffer_private));
+    GGML_ASSERT(ret->magic == 0xdeadbeaf);
+    return ret;
 }
 
 static inline void * get_data_addr(vk_host_buffer_private * vk_private) {
@@ -354,9 +357,6 @@ void * ggml_vk_host_malloc(size_t size) {
 void ggml_vk_host_free(void * ptr) {
     if (ptr) {
         vk_host_buffer_private * vk_private = get_vk_private(ptr);
-
-        GGML_ASSERT(vk_private->magic == 0xdeadbeaf);
-
         if (vk_private->is_gpu_mem) {
             device.unmapMemory(vk_private->gpu_mem);
             device.freeMemory(vk_private->gpu_mem);
@@ -375,5 +375,5 @@ size_t ggml_vk_mul_mat_get_wsize(const struct ggml_tensor * src0, const struct g
 }
 
 void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst, void * wdata, size_t wsize) {
-    return ;
+
 }
