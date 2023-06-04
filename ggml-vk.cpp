@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <unordered_map>
 
 #define APP_NAME "llama.cpp"
 
@@ -21,14 +22,47 @@ static vk::Device         device = {};
 
 static vk::PhysicalDeviceProperties gpu_props = {};
 static vk::PhysicalDeviceMemoryProperties gpu_mem_props = {};
+static uint64_t gpu_local_size = 0;
 
 static uint32_t compute_queue_idx = UINT32_MAX;
 static uint32_t transfer_queue_idx = UINT32_MAX;
 static bool     is_same_queue = false;
 
+static vk::CommandPool compute_cmd_pool = {};
+static vk::CommandPool transfer_cmd_pool = {};
+
 static std::vector<uint32_t> preferred_host_acs_mem_type_idxs;
 
-void init_host_acs_mem_preferences() {
+struct PipelineKey {
+    enum Operation {
+        MatMul,
+        Count,
+    } operation = Count;
+    enum ggml_type src0_type = GGML_TYPE_COUNT;
+    enum ggml_type src1_type = GGML_TYPE_COUNT;
+    enum ggml_type dst_type  = GGML_TYPE_COUNT;
+    bool operator=(const PipelineKey other) const {
+        return this->operation == other.operation &&
+               this->src0_type  == other.src0_type &&
+               this->src1_type  == other.src1_type &&
+               this->dst_type   == other.dst_type;
+    }
+};
+
+template<>
+struct std::hash<PipelineKey> {
+    std::size_t operator()(const PipelineKey& k) const {
+        static_assert(GGML_TYPE_COUNT < UINT8_MAX, "");
+        static_assert(PipelineKey::Count < UINT8_MAX, "");
+        uint32_t to_int = k.operation + static_cast<uint16_t>(k.src0_type << 8) +
+            static_cast<uint32_t>(k.src1_type << 16) + static_cast<uint32_t>(k.dst_type << 24);
+        return std::hash<uint32_t>()(to_int);
+    }
+};
+
+static std::unordered_map<PipelineKey, vk::Pipeline> pipeline_map = {};
+
+static void init_host_acs_mem_preferences() {
     preferred_host_acs_mem_type_idxs.clear();
     for (uint32_t i = 0; i < gpu_mem_props.memoryTypeCount; i++) {
         if (gpu_mem_props.memoryTypes[i].propertyFlags &
@@ -53,7 +87,16 @@ void init_host_acs_mem_preferences() {
     std::sort(preferred_host_acs_mem_type_idxs.begin(), preferred_host_acs_mem_type_idxs.end(), compare);
 }
 
-void print_mem_type_preference() {
+static uint32_t select_device_local_mem(const vk::MemoryPropertyFlags required_flags) {
+    for (uint32_t i = 0; i < gpu_mem_props.memoryTypeCount; i++) {
+        if ((required_flags & gpu_mem_props.memoryTypes[i].propertyFlags) == required_flags) {
+            return i;
+        }
+    }
+    throw std::runtime_error("No available device local memories are found!");
+}
+
+static void print_mem_type_preference() {
     fprintf(stderr, "Host accessible memory allocation preferences:\n");
     for (const uint32_t mem_type_idx : preferred_host_acs_mem_type_idxs) {
         const vk::MemoryHeap & heap = gpu_mem_props.memoryHeaps[gpu_mem_props.memoryTypes[mem_type_idx].heapIndex];
@@ -149,6 +192,12 @@ gpu_select_done:
         fprintf(stderr, "Selected Vulkan physical device '%s' type '%s'\n",
             gpu_props.deviceName.data(),
             vk::to_string(gpu_props.deviceType).c_str());
+
+        for (uint32_t i = 0; i < gpu_mem_props.memoryHeapCount; i++) {
+            if (gpu_mem_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                gpu_local_size = std::max(gpu_local_size, gpu_mem_props.memoryHeaps[i].size);
+            }
+        }
 
         init_host_acs_mem_preferences();
         print_mem_type_preference();
@@ -273,6 +322,27 @@ gpu_select_done:
         result = gpu.createDevice(&device_info, nullptr, &device);
         GGML_ASSERT(result == vk::Result::eSuccess);
     }
+
+    {
+        const auto compute_cmd_pool_info =
+            vk::CommandPoolCreateInfo()
+                .setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
+                .setQueueFamilyIndex(compute_queue_idx);
+        const auto result = device.createCommandPool(
+            &compute_cmd_pool_info, nullptr, &compute_cmd_pool);
+        GGML_ASSERT(result == vk::Result::eSuccess);
+        if (is_same_queue) {
+            transfer_cmd_pool = compute_cmd_pool;
+        } else {
+            const auto transfer_cmd_pool_info =
+                vk::CommandPoolCreateInfo()
+                    .setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
+                    .setQueueFamilyIndex(transfer_queue_idx);
+            const auto result = device.createCommandPool(
+                &transfer_cmd_pool_info, nullptr, &transfer_cmd_pool);
+            GGML_ASSERT(result == vk::Result::eSuccess);
+        }
+    }
 }
 
 struct alignas(GGML_MEM_ALIGN) vk_host_buffer_private {
@@ -280,7 +350,7 @@ struct alignas(GGML_MEM_ALIGN) vk_host_buffer_private {
     bool is_gpu_mem = false;
     vk::MemoryPropertyFlags flags = {};
     vk::DeviceMemory gpu_mem = {};
-    uint32_t data_offset = 0;
+    uint64_t data_offset = 0;
 };
 static_assert(sizeof(vk_host_buffer_private) % GGML_MEM_ALIGN == 0, "");
 
@@ -292,6 +362,16 @@ static inline vk_host_buffer_private * get_vk_private(void * data_ptr) {
     vk_host_buffer_private * ret = reinterpret_cast<vk_host_buffer_private *>(reinterpret_cast<uintptr_t>(data_ptr) - sizeof(vk_host_buffer_private));
     GGML_ASSERT(ret->magic == 0xdeadbeaf);
     return ret;
+}
+
+static inline ggml_object * to_object(const ggml_tensor * tensor) {
+    return reinterpret_cast<ggml_object *>(reinterpret_cast<uintptr_t>(tensor) - GGML_OBJECT_SIZE);
+}
+
+static inline vk_host_buffer_private * get_tensor_vk_private(const ggml_tensor * tensor) {
+    ggml_object * obj = to_object(tensor);
+    void * mem_buffer = obj - obj->offs + GGML_OBJECT_SIZE;
+    return get_vk_private(mem_buffer);
 }
 
 static inline void * get_data_addr(vk_host_buffer_private * vk_private) {
@@ -366,14 +446,53 @@ void ggml_vk_host_free(void * ptr) {
     }
 }
 
-bool ggml_vk_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst) {
-    return false;
-}
-
 size_t ggml_vk_mul_mat_get_wsize(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst) {
     return 0;
 }
 
-void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst, void * wdata, size_t wsize) {
+bool ggml_vk_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst) {
+    if (src0->type == GGML_TYPE_F32 &&
+        src1->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32) {
+            return true;
+        }
+    return false;
+}
 
+void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst, void * wdata, size_t wsize) {
+    vk_host_buffer_private * src0_vk_private = get_tensor_vk_private(src0);
+    vk_host_buffer_private * src1_vk_private = get_tensor_vk_private(src1);
+    vk_host_buffer_private * dst_vk_private = get_tensor_vk_private(dst);
+
+#define CHECK_IS_GPU_MEM(tensor, vk_private) \
+    if (!vk_private->is_gpu_mem || tensor->data != tensor + 1) { \
+        throw std::runtime_error(#tensor " is not allocated on GPU. Functionality not implemented!"); \
+    }
+
+    CHECK_IS_GPU_MEM(src0, src0_vk_private);
+    CHECK_IS_GPU_MEM(src1, src1_vk_private);
+    CHECK_IS_GPU_MEM(dst, dst_vk_private);
+
+    const PipelineKey pipeline_key = {
+        .operation=PipelineKey::MatMul,
+        .src0_type=GGML_TYPE_F32,
+        .src1_type=GGML_TYPE_F32,
+        .dst_type =GGML_TYPE_F32,
+    };
+
+    // iGpu device local memory has similar performance as Host memories?
+    const bool prefer_device_local = (gpu_props.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) &&
+        (to_object(src0)->size + to_object(src1)->size + to_object(dst)->size) < gpu_local_size;
+
+    const vk::Pipeline pipeline = maybe_create_pipeline(pipeline_key);
+
+    vk::CommandBuffer cmdbuf = {};
+    const auto cmd_alloc_info = vk::CommandBufferAllocateInfo()
+                                    .setCommandPool(compute_cmd_pool)
+                                    .setLevel(vk::CommandBufferLevel::ePrimary)
+                                    .setCommandBufferCount(1);
+    auto result = device.allocateCommandBuffers(&cmd_alloc_info, &cmdbuf);
+    GGML_ASSERT(result == vk::Result::eSuccess);
+
+    // TODO
 }
