@@ -31,36 +31,11 @@ static bool     is_same_queue = false;
 static vk::CommandPool compute_cmd_pool = {};
 static vk::CommandPool transfer_cmd_pool = {};
 
+static vk::DescriptorPool descrpt_pool = {};
+
 static std::vector<uint32_t> preferred_host_acs_mem_type_idxs;
 
-struct PipelineKey {
-    enum Operation {
-        MatMul,
-        Count,
-    } operation = Count;
-    enum ggml_type src0_type = GGML_TYPE_COUNT;
-    enum ggml_type src1_type = GGML_TYPE_COUNT;
-    enum ggml_type dst_type  = GGML_TYPE_COUNT;
-    bool operator=(const PipelineKey other) const {
-        return this->operation == other.operation &&
-               this->src0_type  == other.src0_type &&
-               this->src1_type  == other.src1_type &&
-               this->dst_type   == other.dst_type;
-    }
-};
-
-template<>
-struct std::hash<PipelineKey> {
-    std::size_t operator()(const PipelineKey& k) const {
-        static_assert(GGML_TYPE_COUNT < UINT8_MAX, "");
-        static_assert(PipelineKey::Count < UINT8_MAX, "");
-        uint32_t to_int = k.operation + static_cast<uint16_t>(k.src0_type << 8) +
-            static_cast<uint32_t>(k.src1_type << 16) + static_cast<uint32_t>(k.dst_type << 24);
-        return std::hash<uint32_t>()(to_int);
-    }
-};
-
-static std::unordered_map<PipelineKey, vk::Pipeline> pipeline_map = {};
+static constexpr uint32_t max_tensors_per_op = 4;
 
 static void init_host_acs_mem_preferences() {
     preferred_host_acs_mem_type_idxs.clear();
@@ -328,7 +303,7 @@ gpu_select_done:
             vk::CommandPoolCreateInfo()
                 .setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
                 .setQueueFamilyIndex(compute_queue_idx);
-        const auto result = device.createCommandPool(
+        result = device.createCommandPool(
             &compute_cmd_pool_info, nullptr, &compute_cmd_pool);
         GGML_ASSERT(result == vk::Result::eSuccess);
         if (is_same_queue) {
@@ -338,10 +313,26 @@ gpu_select_done:
                 vk::CommandPoolCreateInfo()
                     .setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
                     .setQueueFamilyIndex(transfer_queue_idx);
-            const auto result = device.createCommandPool(
+            result = device.createCommandPool(
                 &transfer_cmd_pool_info, nullptr, &transfer_cmd_pool);
             GGML_ASSERT(result == vk::Result::eSuccess);
         }
+    }
+
+    {
+        const vk::DescriptorPoolSize pool_sizes[] = {
+            vk::DescriptorPoolSize()
+                .setType(vk::DescriptorType::eStorageBuffer)
+                .setDescriptorCount(max_tensors_per_op)
+        };
+
+        const auto descrpt_pool_info = vk::DescriptorPoolCreateInfo()
+            .setMaxSets(1) // At most 1 command in flight
+            .setPoolSizeCount(ARRAY_LEN(pool_sizes))
+            .setPPoolSizes(pool_sizes);
+
+        const vk::Result result = device.createDescriptorPool(&descrpt_pool_info, nullptr, &descrpt_pool);
+        GGML_ASSERT(result == vk::Result::eSuccess);
     }
 }
 
@@ -459,32 +450,104 @@ bool ggml_vk_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
     return false;
 }
 
-void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst, void * wdata, size_t wsize) {
-    vk_host_buffer_private * src0_vk_private = get_tensor_vk_private(src0);
-    vk_host_buffer_private * src1_vk_private = get_tensor_vk_private(src1);
-    vk_host_buffer_private * dst_vk_private = get_tensor_vk_private(dst);
+struct PipelineKey {
+    enum Operation {
+        MatMul,
+        Count,
+    } operation = Count;
+    enum ggml_type src0_type = GGML_TYPE_COUNT;
+    enum ggml_type src1_type = GGML_TYPE_COUNT;
+    enum ggml_type dst_type  = GGML_TYPE_COUNT;
+    bool operator=(const PipelineKey other) const {
+        return this->operation == other.operation &&
+               this->src0_type  == other.src0_type &&
+               this->src1_type  == other.src1_type &&
+               this->dst_type   == other.dst_type;
+    }
+};
 
-#define CHECK_IS_GPU_MEM(tensor, vk_private) \
-    if (!vk_private->is_gpu_mem || tensor->data != tensor + 1) { \
+template<>
+struct std::hash<PipelineKey> {
+    std::size_t operator()(const PipelineKey& k) const {
+        static_assert(GGML_TYPE_COUNT < UINT8_MAX, "");
+        static_assert(PipelineKey::Count < UINT8_MAX, "");
+        uint32_t to_int = k.operation + static_cast<uint16_t>(k.src0_type << 8) +
+            static_cast<uint32_t>(k.src1_type << 16) + static_cast<uint32_t>(k.dst_type << 24);
+        return std::hash<uint32_t>()(to_int);
+    }
+};
+
+static std::unordered_map<PipelineKey, vk::Pipeline> pipeline_map = {};
+
+static vk::Pipeline get_pipeline(const PipelineKey pipeline_key) {
+    // TODO change to vector
+    const auto cached_pipeline = pipeline_map.find(pipeline_key);
+    if (cached_pipeline != pipeline_map.end()) {
+        return cached_pipeline->second;
+    }
+
+
+    const char mat_mul_fp32_shader[] = R"MatMulFp32(
+        #version 420
+        #extension GL_ARB_compute_shader : enable
+
+        #define dst_ROWS 8
+        #define dst_COLS 8
+
+        float dst_staging[dst_ROWS][dst_COLS] =
+
+
+    )MatMulFp32";
+
+}
+
+template<bool transfer_src>
+struct AutoTensorBuffer {
+    AutoTensorBuffer(const struct ggml_tensor * tensor) {
+        const vk::DeviceSize buffer_size = to_object(tensor)->size - sizeof(struct ggml_tensor);
+        const auto buffer_info = vk::BufferCreateInfo()
+            .setFlags(vk::BufferCreateFlags{})
+            .setSize(size)
+            .setUsage(vk::BufferUsageFlagBits::eStorageBuffer |
+                (transfer_src ? vk::BufferUsageFlagBits::eTransferSrc
+                              : vk::BufferUsageFlagBits::eTransferDst))
+            .setSharingMode(vk::SharingMode::eExclusive);
+        const auto result = device.createBuffer(buffer_info, &vk_buffer);
+        GGML_ASSERT(result == vk::Result::eSuccess);
+
+        const vk::DeviceSize offset = to_object(tensor)->data - private;
+        vk_host_buffer_private* private = get_tensor_vk_private(tensor);
+        result = device.bindBufferMemory(vk_buffer, private->gpu_mem, offset);
+        GGML_ASSERT(result == vk::Result::eSuccess);
+    }
+
+    ~AutoTensorBuffer() {
+        device.destroyBuffer(vk_buffer, nullptr);
+    }
+
+    AutoTensorBuffer(const AutoTensorBuffer &) = delete;
+    AutoTensorBuffer & operator=(const AutoTensorBuffer &) = delete;
+
+    vk::Buffer vk_buffer = {};
+};
+
+
+void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst, void * wdata, size_t wsize) {
+#define CHECK_IS_GPU_MEM(tensor) \
+    if (!get_tensor_vk_private(tensor)->is_gpu_mem || tensor->data != tensor + 1) { \
         throw std::runtime_error(#tensor " is not allocated on GPU. Functionality not implemented!"); \
     }
 
-    CHECK_IS_GPU_MEM(src0, src0_vk_private);
-    CHECK_IS_GPU_MEM(src1, src1_vk_private);
-    CHECK_IS_GPU_MEM(dst, dst_vk_private);
+    CHECK_IS_GPU_MEM(src0);
+    CHECK_IS_GPU_MEM(src1);
+    CHECK_IS_GPU_MEM(dst);
 
-    const PipelineKey pipeline_key = {
+    const vk::Pipeline pipeline = get_pipeline(PipelineKey{
         .operation=PipelineKey::MatMul,
         .src0_type=GGML_TYPE_F32,
         .src1_type=GGML_TYPE_F32,
         .dst_type =GGML_TYPE_F32,
-    };
-
-    // iGpu device local memory has similar performance as Host memories?
-    const bool prefer_device_local = (gpu_props.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) &&
-        (to_object(src0)->size + to_object(src1)->size + to_object(dst)->size) < gpu_local_size;
-
-    const vk::Pipeline pipeline = maybe_create_pipeline(pipeline_key);
+    });
 
     vk::CommandBuffer cmdbuf = {};
     const auto cmd_alloc_info = vk::CommandBufferAllocateInfo()
@@ -494,5 +557,21 @@ void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor *
     auto result = device.allocateCommandBuffers(&cmd_alloc_info, &cmdbuf);
     GGML_ASSERT(result == vk::Result::eSuccess);
 
-    // TODO
+    // iGpu device local memory has similar performance as host memories?
+    const bool prefer_device_local = (gpu_props.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) &&
+        (to_object(src0)->size + to_object(src1)->size + to_object(dst)->size) < gpu_local_size;
+
+    vk::DeviceMemory src1_mem = {};
+    if (prefer_device_local) {
+        throw std::runtime_error("Not implemented!");
+    } else {
+        AutoTensorBuffer<true> src0_buffer(src0);
+        AutoTensorBuffer<true> src1_buffer(src1);
+        AutoTensorBuffer<false> dst_buffer(dst);
+
+        static_assert(GGML_MEM_ALIGN % 4 == 0, "Fill buffer requires 4-byte alignment!");
+        cmdbuf.fillBuffer(dst_buffer.vk_buffer, 0, VK_WHOLE_SIZE, 0);
+
+
+    }
 }
