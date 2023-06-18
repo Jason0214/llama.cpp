@@ -213,16 +213,9 @@ if (LLAMA_CLBLAST)
 endif()
 
 if (LLAMA_VULKAN)
-    find_package(Vulkan REQUIRED)
-    set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ${Vulkan_LIBRARY})
+    find_package(Vulkan REQUIRED shaderc_combined)
+    set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ${Vulkan_LIBRARY} ${Vulkan_shaderc_combined_LIBRARY})
     include_directories(${Vulkan_INCLUDE_DIRS})
-
-    # if (APPLE)
-    #     if (NOT Vulkan_MoltenVK_FOUND)
-    #         message(FATAL_ERROR "MoltenVK not found! Required for using Vulkan on Apple OSes!")
-    #     endif()
-    #     set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ${Vulkan_MoltenVK_LIBRARY})
-    # endif()
 
     set(GGML_VULKAN_SOURCES ggml-vk.cpp ggml-vk.h)
     add_compile_definitions(GGML_USE_VULKAN)

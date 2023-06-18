@@ -3,6 +3,7 @@
 #include "ggml.h"
 
 #include <vulkan/vulkan.hpp>
+#include <shaderc/shaderc.hpp>
 
 #define __STDC_FORMAT_MACROS 1
 #include <inttypes.h>
@@ -10,7 +11,6 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
-#include <unordered_map>
 
 #define APP_NAME "llama.cpp"
 
@@ -31,7 +31,9 @@ static bool     is_same_queue = false;
 static vk::CommandPool compute_cmd_pool = {};
 static vk::CommandPool transfer_cmd_pool = {};
 
-static vk::DescriptorPool descrpt_pool = {};
+static vk::DescriptorPool descript_pool = {};
+
+static vk::PipelineCache pipeline_cache = {};
 
 static std::vector<uint32_t> preferred_host_acs_mem_type_idxs;
 
@@ -197,6 +199,9 @@ gpu_select_done:
                     enabled_device_exts.push_back(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
                     has_vk_amd_allocation_behavior = true;
                 }
+                else if (!strcmp("VK_KHR_portability_subset", device_exts[i].extensionName)) {
+                    enabled_device_exts.push_back("VK_KHR_portability_subset");
+                }
             }
         }
     }
@@ -282,7 +287,6 @@ gpu_select_done:
                 // No required device layers.
                 .setEnabledLayerCount(0)
                 .setPpEnabledLayerNames(nullptr)
-                // No required device extensions.
                 .setEnabledExtensionCount(enabled_device_exts.size())
                 .setPpEnabledExtensionNames(enabled_device_exts.data())
                 // No required features.
@@ -295,6 +299,12 @@ gpu_select_done:
         }
 
         result = gpu.createDevice(&device_info, nullptr, &device);
+        GGML_ASSERT(result == vk::Result::eSuccess);
+    }
+
+    {
+        const auto pipeline_cache_info = vk::PipelineCacheCreateInfo();
+        result = device.createPipelineCache(&pipeline_cache_info, nullptr, &pipeline_cache);
         GGML_ASSERT(result == vk::Result::eSuccess);
     }
 
@@ -326,12 +336,12 @@ gpu_select_done:
                 .setDescriptorCount(max_tensors_per_op)
         };
 
-        const auto descrpt_pool_info = vk::DescriptorPoolCreateInfo()
+        const auto descript_pool_info = vk::DescriptorPoolCreateInfo()
             .setMaxSets(1) // At most 1 command in flight
             .setPoolSizeCount(ARRAY_LEN(pool_sizes))
             .setPPoolSizes(pool_sizes);
 
-        const vk::Result result = device.createDescriptorPool(&descrpt_pool_info, nullptr, &descrpt_pool);
+        const vk::Result result = device.createDescriptorPool(&descript_pool_info, nullptr, &descript_pool);
         GGML_ASSERT(result == vk::Result::eSuccess);
     }
 }
@@ -349,7 +359,7 @@ static inline size_t calc_alloc_size(const size_t requested_size) {
     return requested_size + sizeof(vk_host_buffer_private) + static_cast<size_t>(GGML_MEM_ALIGN - 1);
 }
 
-static inline vk_host_buffer_private * get_vk_private(void * data_ptr) {
+static inline vk_host_buffer_private * get_vk_private(const void * data_ptr) {
     vk_host_buffer_private * ret = reinterpret_cast<vk_host_buffer_private *>(reinterpret_cast<uintptr_t>(data_ptr) - sizeof(vk_host_buffer_private));
     GGML_ASSERT(ret->magic == 0xdeadbeaf);
     return ret;
@@ -361,7 +371,7 @@ static inline ggml_object * to_object(const ggml_tensor * tensor) {
 
 static inline vk_host_buffer_private * get_tensor_vk_private(const ggml_tensor * tensor) {
     ggml_object * obj = to_object(tensor);
-    void * mem_buffer = obj - obj->offs + GGML_OBJECT_SIZE;
+    const void * mem_buffer = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tensor) - obj->offs);
     return get_vk_private(mem_buffer);
 }
 
@@ -438,68 +448,193 @@ void ggml_vk_host_free(void * ptr) {
 }
 
 size_t ggml_vk_mul_mat_get_wsize(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst) {
+    (void)src0;
+    (void)src1;
+    (void)dst;
     return 0;
 }
 
 bool ggml_vk_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst) {
     if (src0->type == GGML_TYPE_F32 &&
         src1->type == GGML_TYPE_F32 &&
-        dst->type == GGML_TYPE_F32) {
+        dst->type == GGML_TYPE_F32 &&
+        src0->n_dims == 2 &&
+        src1->n_dims == 2 &&
+        dst->n_dims == 2) {
             return true;
         }
     return false;
 }
 
-struct PipelineKey {
-    enum Operation {
-        MatMul,
-        Count,
-    } operation = Count;
-    enum ggml_type src0_type = GGML_TYPE_COUNT;
-    enum ggml_type src1_type = GGML_TYPE_COUNT;
-    enum ggml_type dst_type  = GGML_TYPE_COUNT;
-    bool operator=(const PipelineKey other) const {
-        return this->operation == other.operation &&
-               this->src0_type  == other.src0_type &&
-               this->src1_type  == other.src1_type &&
-               this->dst_type   == other.dst_type;
-    }
+enum class KernelType {
+    MAT_MUL_F32,
 };
 
-template<>
-struct std::hash<PipelineKey> {
-    std::size_t operator()(const PipelineKey& k) const {
-        static_assert(GGML_TYPE_COUNT < UINT8_MAX, "");
-        static_assert(PipelineKey::Count < UINT8_MAX, "");
-        uint32_t to_int = k.operation + static_cast<uint16_t>(k.src0_type << 8) +
-            static_cast<uint32_t>(k.src1_type << 16) + static_cast<uint32_t>(k.dst_type << 24);
-        return std::hash<uint32_t>()(to_int);
-    }
+struct KernelPipeline {
+    vk::PipelineLayout pipeline_layout = {};
+    vk::DescriptorSetLayout descript_layout = {};
+    vk::DescriptorSet descript_set = {}; // Only 1 set is used. At most one cmd in flight.
+    vk::Pipeline pipeline = {};
+    static constexpr uint32_t tile_rows_per_th = 8;
+    static constexpr uint32_t tile_cols_per_th = 8;
+    static constexpr uint32_t local_size_x = 8;
+    static constexpr uint32_t local_size_y = 8;
+    bool valid = false;
 };
 
-static std::unordered_map<PipelineKey, vk::Pipeline> pipeline_map = {};
+static const KernelPipeline & get_pipeline(const KernelType kernel_type) {
+    vk::Result result = vk::Result::eSuccess;
+    switch(kernel_type) {
+        case KernelType::MAT_MUL_F32: {
+            static KernelPipeline mat_mul_f32_pipeline = {};
+            if (mat_mul_f32_pipeline.valid) {
+                return mat_mul_f32_pipeline;
+            }
 
-static vk::Pipeline get_pipeline(const PipelineKey pipeline_key) {
-    // TODO change to vector
-    const auto cached_pipeline = pipeline_map.find(pipeline_key);
-    if (cached_pipeline != pipeline_map.end()) {
-        return cached_pipeline->second;
+            const std::string mat_mul_f32_comp = std::string(R"MatMulFp32Header(
+                #version 420
+                #extension GL_ARB_compute_shader : enable
+                #extension GL_KHR_shader_subgroup : enable
+
+            )MatMulFp32Header") +
+            "layout(local_size_x = " + std::to_string(mat_mul_f32_pipeline.local_size_x) + ", "
+            "local_size_y = " + std::to_string(mat_mul_f32_pipeline.local_size_y) + ", local_size_z = 1) in; \n" +
+            "const uint32_t tileRows = " + std::to_string(mat_mul_f32_pipeline.tile_rows_per_th) + ";\n" +
+            "const uint32_t tileCols = " + std::to_string(mat_mul_f32_pipeline.tile_cols_per_th) + ";\n" +
+            std::string(R"MatMulF32Body(
+                const uvec2 invId = uvec2(gl_GlobalInvocationID.xy);
+
+                layout (push_constant, std430) uniform constants {
+                    uint32_t M;
+                    uint32_t K;
+                    uint32_t N;
+                } 2DTensorDims;
+
+                // src0 M x K
+                // src1 K x N
+                // dst  M x N
+                layout (set=0, binding=0) readonly buffer float src0[];
+                layout (set=0, binding=1) readonly buffer float src1[];
+                layout (set=0, binding=2) readonly buffer float dst[];
+
+                float src0Local[tileRows];
+                float dstLocal[tileRows][tileCols];
+
+                [[unroll]] for (uint32_t i = 0; i < tileRows; i++) {
+                    [[unroll]] for (uint32_t j = 0; j < tileCols; j++) {
+                        dstLocal[i][j] = 0;
+                    }
+                }
+
+                [[unroll]] for (uint32_t k = 0; k < 2DTensorDims.K; k++) {
+                    [[unroll]] for (uint32_t i = 0; i < tileRows; i++) {
+                        src0Local[i] = src0[(invId.y * tileRows + i) * 2DTensorDims.M + 2DTensorDims.K];
+                    }
+
+                    float src1Local;
+                    [[unroll]] for (uint32_t j = 0; j < tileCols; j++) {
+                        src1Local = src1[k * 2DTensorDims.M + invId.x * tileCols + j];
+
+                        for (uint32_t i = 0; i < tileRows; i++) {
+                            dstLocal[i][j] = src0Local[i] * src1Local + dstLocal[i][j];
+                        }
+                    }
+                }
+
+                [[unroll]] for (uint32_t i = 0; i < tileRows; i++) {
+                    [[unroll]] for (uint32_t j = 0; j < tileCols; j++) {
+                        dst[(invId.y * tileRows + j) * 2DTensorDims.M + invId.x * tileCols + i] = dst[i][j];
+                    }
+                }
+
+            )MatMulF32Body");
+
+            vk::ShaderModule shader_module = {};
+            {
+                shaderc::Compiler compiler;
+                shaderc::CompileOptions options;
+                shaderc::SpvCompilationResult spv_result = compiler.CompileGlslToSpv(mat_mul_f32_comp, shaderc_shader_kind::shaderc_glsl_compute_shader, "mat_mul_f32_comp", options);
+                if (spv_result.GetCompilationStatus() != shaderc_compilation_status_success) {
+                    throw std::runtime_error("Fail to compile Mat Mul F32 compute shader: " + spv_result.GetErrorMessage());
+                }
+                std::vector<uint32_t> comp_spirv = {};
+                comp_spirv.assign(spv_result.cbegin(), spv_result.cend());
+                const auto shader_info = vk::ShaderModuleCreateInfo()
+                    .setCodeSize(comp_spirv.size())
+                    .setPCode(comp_spirv.data());
+
+                result = device.createShaderModule(&shader_info, nullptr, &shader_module);
+                GGML_ASSERT(result == vk::Result::eSuccess);
+            }
+
+            {
+                const vk::DescriptorSetLayoutBinding bindings[] = {
+                    vk::DescriptorSetLayoutBinding()
+                        .setBinding(0)
+                        .setDescriptorType(vk::DescriptorType::eStorageBuffer)
+                        .setDescriptorCount(1)
+                        .setStageFlags(vk::ShaderStageFlagBits::eCompute),
+                    vk::DescriptorSetLayoutBinding()
+                        .setBinding(1)
+                        .setDescriptorType(vk::DescriptorType::eStorageBuffer)
+                        .setDescriptorCount(1)
+                        .setStageFlags(vk::ShaderStageFlagBits::eCompute),
+                    vk::DescriptorSetLayoutBinding()
+                        .setBinding(2)
+                        .setDescriptorType(vk::DescriptorType::eStorageBuffer)
+                        .setDescriptorCount(1)
+                        .setStageFlags(vk::ShaderStageFlagBits::eCompute),
+                };
+
+                const auto descript_layout_info = vk::DescriptorSetLayoutCreateInfo()
+                    .setFlags({})
+                    .setBindings(bindings)
+                    .setBindingCount(ARRAY_LEN(bindings));
+                result = device.createDescriptorSetLayout(&descript_layout_info, nullptr, &mat_mul_f32_pipeline.descript_layout);
+                GGML_ASSERT(result == vk::Result::eSuccess);
+            }
+
+            {
+                const auto push_const_info = vk::PushConstantRange()
+                    .setOffset(0)
+                    .setSize(sizeof(uint32_t) * 3)
+                    .setStageFlags(vk::ShaderStageFlagBits::eCompute);
+
+                const auto pipeline_layout_info = vk::PipelineLayoutCreateInfo()
+                    .setSetLayoutCount(1)
+                    .setPSetLayouts(&mat_mul_f32_pipeline.descript_layout)
+                    .setPPushConstantRanges(&push_const_info)
+                    .setPushConstantRangeCount(1);
+
+                result = device.createPipelineLayout(&pipeline_layout_info, nullptr, &mat_mul_f32_pipeline.pipeline_layout);
+                GGML_ASSERT(result == vk::Result::eSuccess);
+            }
+
+            {
+                const auto shader_stage_info = vk::PipelineShaderStageCreateInfo()
+                                   .setStage(vk::ShaderStageFlagBits::eCompute)
+                                   .setModule(shader_module)
+                                   .setPName("main");
+
+                const auto pipeline_info = vk::ComputePipelineCreateInfo()
+                    .setStage(shader_stage_info)
+                    .setLayout(mat_mul_f32_pipeline.pipeline_layout);
+
+                result = device.createComputePipelines(
+                    pipeline_cache, 1, &pipeline_info, nullptr, &mat_mul_f32_pipeline.pipeline);
+                GGML_ASSERT(result == vk::Result::eSuccess);
+
+                device.destroyShaderModule(shader_module, nullptr);
+            }
+
+            mat_mul_f32_pipeline.valid = true;
+            return mat_mul_f32_pipeline;
+        }
+        default:
+            throw std::runtime_error("Unknown vulkan kernel type!");
     }
-
-
-    const char mat_mul_fp32_shader[] = R"MatMulFp32(
-        #version 420
-        #extension GL_ARB_compute_shader : enable
-
-        #define dst_ROWS 8
-        #define dst_COLS 8
-
-        float dst_staging[dst_ROWS][dst_COLS] =
-
-
-    )MatMulFp32";
-
 }
+
 
 template<bool transfer_src>
 struct AutoTensorBuffer {
@@ -507,18 +642,25 @@ struct AutoTensorBuffer {
         const vk::DeviceSize buffer_size = to_object(tensor)->size - sizeof(struct ggml_tensor);
         const auto buffer_info = vk::BufferCreateInfo()
             .setFlags(vk::BufferCreateFlags{})
-            .setSize(size)
+            .setSize(buffer_size)
             .setUsage(vk::BufferUsageFlagBits::eStorageBuffer |
                 (transfer_src ? vk::BufferUsageFlagBits::eTransferSrc
                               : vk::BufferUsageFlagBits::eTransferDst))
             .setSharingMode(vk::SharingMode::eExclusive);
-        const auto result = device.createBuffer(buffer_info, &vk_buffer);
+        const auto result = device.createBuffer(&buffer_info, nullptr, &vk_buffer);
         GGML_ASSERT(result == vk::Result::eSuccess);
 
-        const vk::DeviceSize offset = to_object(tensor)->data - private;
-        vk_host_buffer_private* private = get_tensor_vk_private(tensor);
-        result = device.bindBufferMemory(vk_buffer, private->gpu_mem, offset);
-        GGML_ASSERT(result == vk::Result::eSuccess);
+        vk_host_buffer_private* vk_buffer_private = get_tensor_vk_private(tensor);
+        const vk::DeviceSize offset = reinterpret_cast<uint8_t*>(tensor->data) - reinterpret_cast<uint8_t*>(vk_buffer_private);
+        device.bindBufferMemory(vk_buffer, vk_buffer_private->gpu_mem, offset);
+    }
+
+    vk::WriteDescriptorSet write_descriptor() {
+        return vk::WriteDescriptorSet()
+            .setDescriptorType(vk::DescriptorType::eStorageBuffer)
+            .setDescriptorCount(1)
+            .setBufferInfo(vk::DescriptorBufferInfo()
+                .setBuffer(vk_buffer).setOffset(0).setRange(VK_WHOLE_SIZE));
     }
 
     ~AutoTensorBuffer() {
@@ -533,6 +675,8 @@ struct AutoTensorBuffer {
 
 
 void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst, void * wdata, size_t wsize) {
+    (void)wdata;
+    (void)wsize;
 #define CHECK_IS_GPU_MEM(tensor) \
     if (!get_tensor_vk_private(tensor)->is_gpu_mem || tensor->data != tensor + 1) { \
         throw std::runtime_error(#tensor " is not allocated on GPU. Functionality not implemented!"); \
@@ -542,12 +686,7 @@ void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor *
     CHECK_IS_GPU_MEM(src1);
     CHECK_IS_GPU_MEM(dst);
 
-    const vk::Pipeline pipeline = get_pipeline(PipelineKey{
-        .operation=PipelineKey::MatMul,
-        .src0_type=GGML_TYPE_F32,
-        .src1_type=GGML_TYPE_F32,
-        .dst_type =GGML_TYPE_F32,
-    });
+    const KernelPipeline & kernel_pipeline = get_pipeline(KernelType::MAT_MUL_F32);
 
     vk::CommandBuffer cmdbuf = {};
     const auto cmd_alloc_info = vk::CommandBufferAllocateInfo()
@@ -557,11 +696,13 @@ void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor *
     auto result = device.allocateCommandBuffers(&cmd_alloc_info, &cmdbuf);
     GGML_ASSERT(result == vk::Result::eSuccess);
 
+    const auto cmd_buf_begin_info = vk::CommandBufferBeginInfo();
+    cmdbuf.begin(cmd_buf_begin_info);
+
     // iGpu device local memory has similar performance as host memories?
     const bool prefer_device_local = (gpu_props.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) &&
         (to_object(src0)->size + to_object(src1)->size + to_object(dst)->size) < gpu_local_size;
 
-    vk::DeviceMemory src1_mem = {};
     if (prefer_device_local) {
         throw std::runtime_error("Not implemented!");
     } else {
@@ -569,9 +710,51 @@ void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor *
         AutoTensorBuffer<true> src1_buffer(src1);
         AutoTensorBuffer<false> dst_buffer(dst);
 
-        static_assert(GGML_MEM_ALIGN % 4 == 0, "Fill buffer requires 4-byte alignment!");
-        cmdbuf.fillBuffer(dst_buffer.vk_buffer, 0, VK_WHOLE_SIZE, 0);
+        const vk::WriteDescriptorSet write_descripts[] = {
+            src0_buffer.write_descriptor().setDstSet(kernel_pipeline.descript_set).setDstBinding(0),
+            src1_buffer.write_descriptor().setDstSet(kernel_pipeline.descript_set).setDstBinding(1),
+            dst_buffer.write_descriptor().setDstSet(kernel_pipeline.descript_set).setDstBinding(2),
+        };
+        device.updateDescriptorSets(ARRAY_LEN(write_descripts), write_descripts, 0, nullptr);
 
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, kernel_pipeline.pipeline);
+        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                  kernel_pipeline.pipeline_layout,
+                                  0, 1, &kernel_pipeline.descript_set, 0, nullptr);
 
+        if (src0->ne[0] > UINT32_MAX || src1->ne[1] > UINT32_MAX || src0->ne[1] > UINT32_MAX) {
+            throw std::runtime_error("Larger than UIN32_MAX tensor dimenstion not implemented!");
+        }
+        struct MatMulDims {
+            uint32_t K;
+            uint32_t M;
+            uint32_t N;
+        } mat_mul_dims = {
+            .M=static_cast<uint32_t>(src0->ne[0]),
+            .N=static_cast<uint32_t>(src1->ne[1]),
+            .K=static_cast<uint32_t>(src0->ne[1]),
+        };
+
+        cmdbuf.pushConstants(kernel_pipeline.pipeline_layout,
+                             vk::ShaderStageFlagBits::eCompute,
+                             0,
+                             sizeof(MatMulDims),
+                             &mat_mul_dims);
+
+        const auto div_round_up = [] (uint32_t x, uint32_t y) { return (x + y - 1) / y; };
+        cmdbuf.dispatch(
+            div_round_up(dst->ne[0], kernel_pipeline.local_size_x * kernel_pipeline.tile_rows_per_th),
+            div_round_up(dst->ne[1], kernel_pipeline.local_size_x * kernel_pipeline.tile_cols_per_th),
+            1);
     }
+    cmdbuf.end();
+
+    const vk::Queue compute_queue = device.getQueue(compute_queue_idx, 0);
+    const auto submit_info = vk::SubmitInfo()
+        .setWaitSemaphoreCount(0)
+        .setCommandBufferCount(1)
+        .setPCommandBuffers(&cmdbuf)
+        .setSignalSemaphoreCount(0);
+    compute_queue.submit(submit_info, {});
+    compute_queue.waitIdle();
 }
