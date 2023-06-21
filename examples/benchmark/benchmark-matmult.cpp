@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "build-info.h"
+#include "llama-util.h"
 
 #include <locale.h>
 #include <assert.h>
@@ -120,13 +121,33 @@ int main(int argc, char ** argv)  {
     ctx_size += sizex*sizey*ggml_type_sizef(GGML_TYPE_F32); // BLAS
     ctx_size += 1024*1024*16;
 
+#ifdef GGML_USE_VULKAN
+    // Init backend
+    // needed to initialize f16 tables
+    {
+        struct ggml_init_params params = { 0, NULL, false };
+        struct ggml_context * ctx = ggml_init(params);
+        ggml_free(ctx);
+    }
+#endif
+
     printf("Allocating Memory of size %li bytes, %li MB\n",ctx_size, (ctx_size/1024/1024));
 
+#ifdef GGML_USE_VULKAN
+    llama_ctx_buffer buf;
+    buf.resize(ctx_size);
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ctx_size,
+        /*.mem_buffer =*/ buf.addr,
+        /* no_alloc   =*/ 0
+    };
+#else
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx_size,
         /*.mem_buffer =*/ NULL,
         /* no_alloc   =*/ 0
     };
+#endif
 
     ctx = ggml_init(params);
     if (!ctx) {

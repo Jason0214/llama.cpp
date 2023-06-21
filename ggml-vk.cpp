@@ -550,7 +550,6 @@ static const KernelPipeline & get_pipeline(const KernelType kernel_type) {
                     }
                 }
             )MatMulF32Body");
-            fprintf(stderr, "%s\n", mat_mul_f32_comp.c_str());
 
             vk::ShaderModule shader_module = {};
             {
@@ -563,7 +562,7 @@ static const KernelPipeline & get_pipeline(const KernelType kernel_type) {
                 std::vector<uint32_t> comp_spirv = {};
                 comp_spirv.assign(spv_result.cbegin(), spv_result.cend());
                 const auto shader_info = vk::ShaderModuleCreateInfo()
-                    .setCodeSize(comp_spirv.size())
+                    .setCodeSize(comp_spirv.size() * sizeof(uint32_t))
                     .setPCode(comp_spirv.data());
 
                 result = device.createShaderModule(&shader_info, nullptr, &shader_module);
@@ -703,7 +702,7 @@ void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor *
     cmdbuf.begin(cmd_buf_begin_info);
 
     // iGpu device local memory has similar performance as host memories?
-    const bool prefer_device_local = (gpu_props.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) &&
+    const bool prefer_device_local = (gpu_props.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) &&
         (to_object(src0)->size + to_object(src1)->size + to_object(dst)->size) < gpu_local_size;
 
     if (prefer_device_local) {
