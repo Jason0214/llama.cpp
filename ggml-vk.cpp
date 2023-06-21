@@ -198,9 +198,10 @@ gpu_select_done:
                 if (!strcmp(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME, device_exts[i].extensionName)) {
                     enabled_device_exts.push_back(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
                     has_vk_amd_allocation_behavior = true;
-                }
-                else if (!strcmp("VK_KHR_portability_subset", device_exts[i].extensionName)) {
+                } else if (!strcmp("VK_KHR_portability_subset", device_exts[i].extensionName)) {
                     enabled_device_exts.push_back("VK_KHR_portability_subset");
+                } else if (!strcmp(VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, device_exts[i].extensionName)) {
+                    enabled_device_exts.push_back(VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME);
                 }
             }
         }
@@ -361,8 +362,12 @@ static inline size_t calc_alloc_size(const size_t requested_size) {
 
 static inline vk_host_buffer_private * get_vk_private(const void * data_ptr) {
     vk_host_buffer_private * ret = reinterpret_cast<vk_host_buffer_private *>(reinterpret_cast<uintptr_t>(data_ptr) - sizeof(vk_host_buffer_private));
-    GGML_ASSERT(ret->magic == 0xdeadbeaf);
+    GGML_ASSERT(ret->magic == 0xdeadbeef);
     return ret;
+}
+
+static inline void * get_data_addr(vk_host_buffer_private * vk_private) {
+    return reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(vk_private) + sizeof(vk_host_buffer_private));
 }
 
 static inline ggml_object * to_object(const ggml_tensor * tensor) {
@@ -373,10 +378,6 @@ static inline vk_host_buffer_private * get_tensor_vk_private(const ggml_tensor *
     ggml_object * obj = to_object(tensor);
     const void * mem_buffer = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tensor) - obj->offs);
     return get_vk_private(mem_buffer);
-}
-
-static inline void * get_data_addr(vk_host_buffer_private * vk_private) {
-    return reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(vk_private) + sizeof(vk_host_buffer_private));
 }
 
 void * ggml_vk_host_malloc(size_t size) {
@@ -426,7 +427,7 @@ void * ggml_vk_host_malloc(size_t size) {
 
     constexpr uintptr_t align_mask = GGML_MEM_ALIGN - 1u;
     void * aligned_addr = reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(addr) + align_mask) & ~align_mask);
-    vk_host_buffer_private * vk_private = new (aligned_addr) vk_host_buffer_private;
+    vk_host_buffer_private * vk_private = new (aligned_addr) vk_host_buffer_private{};
     vk_private->is_gpu_mem = gpu_mem != vk::DeviceMemory{};
     vk_private->flags = gpu_mem_flags;
     vk_private->gpu_mem = gpu_mem;
@@ -492,62 +493,64 @@ static const KernelPipeline & get_pipeline(const KernelType kernel_type) {
             }
 
             const std::string mat_mul_f32_comp = std::string(R"MatMulFp32Header(
-                #version 420
+                #version 430
                 #extension GL_ARB_compute_shader : enable
-                #extension GL_KHR_shader_subgroup : enable
+                #extension GL_EXT_control_flow_attributes : enable
 
             )MatMulFp32Header") +
-            "layout(local_size_x = " + std::to_string(mat_mul_f32_pipeline.local_size_x) + ", "
+            "layout (local_size_x = " + std::to_string(mat_mul_f32_pipeline.local_size_x) + ", "
             "local_size_y = " + std::to_string(mat_mul_f32_pipeline.local_size_y) + ", local_size_z = 1) in; \n" +
-            "const uint32_t tileRows = " + std::to_string(mat_mul_f32_pipeline.tile_rows_per_th) + ";\n" +
-            "const uint32_t tileCols = " + std::to_string(mat_mul_f32_pipeline.tile_cols_per_th) + ";\n" +
+            "const uint tileRows = " + std::to_string(mat_mul_f32_pipeline.tile_rows_per_th) + ";\n" +
+            "const uint tileCols = " + std::to_string(mat_mul_f32_pipeline.tile_cols_per_th) + ";\n" +
             std::string(R"MatMulF32Body(
-                const uvec2 invId = uvec2(gl_GlobalInvocationID.xy);
+                uvec2 invId = uvec2(gl_GlobalInvocationID.xy);
 
                 layout (push_constant, std430) uniform constants {
-                    uint32_t M;
-                    uint32_t K;
-                    uint32_t N;
-                } 2DTensorDims;
+                    uint M;
+                    uint K;
+                    uint N;
+                } tensorDims;
 
                 // src0 M x K
                 // src1 K x N
                 // dst  M x N
-                layout (set=0, binding=0) readonly buffer float src0[];
-                layout (set=0, binding=1) readonly buffer float src1[];
-                layout (set=0, binding=2) readonly buffer float dst[];
+                layout (set=0, binding=0) readonly buffer src0Buffer { float src0[]; };
+                layout (set=0, binding=1) readonly buffer src1Buffer { float src1[]; };
+                layout (set=0, binding=2) writeonly buffer dstBuffer { float dst[]; };
 
                 float src0Local[tileRows];
                 float dstLocal[tileRows][tileCols];
 
-                [[unroll]] for (uint32_t i = 0; i < tileRows; i++) {
-                    [[unroll]] for (uint32_t j = 0; j < tileCols; j++) {
-                        dstLocal[i][j] = 0;
-                    }
-                }
-
-                [[unroll]] for (uint32_t k = 0; k < 2DTensorDims.K; k++) {
-                    [[unroll]] for (uint32_t i = 0; i < tileRows; i++) {
-                        src0Local[i] = src0[(invId.y * tileRows + i) * 2DTensorDims.M + 2DTensorDims.K];
+                void main() {
+                    [[unroll]] for (uint i = 0; i < tileRows; i++) {
+                        [[unroll]] for (uint j = 0; j < tileCols; j++) {
+                            dstLocal[i][j] = 0;
+                        }
                     }
 
-                    float src1Local;
-                    [[unroll]] for (uint32_t j = 0; j < tileCols; j++) {
-                        src1Local = src1[k * 2DTensorDims.M + invId.x * tileCols + j];
+                    [[unroll]] for (uint k = 0; k < tensorDims.K; k++) {
+                        [[unroll]] for (uint i = 0; i < tileRows; i++) {
+                            src0Local[i] = src0[(invId.y * tileRows + i) * tensorDims.M + tensorDims.K];
+                        }
 
-                        for (uint32_t i = 0; i < tileRows; i++) {
-                            dstLocal[i][j] = src0Local[i] * src1Local + dstLocal[i][j];
+                        float src1Local;
+                        [[unroll]] for (uint j = 0; j < tileCols; j++) {
+                            src1Local = src1[k * tensorDims.M + invId.x * tileCols + j];
+
+                            for (uint i = 0; i < tileRows; i++) {
+                                dstLocal[i][j] = src0Local[i] * src1Local + dstLocal[i][j];
+                            }
+                        }
+                    }
+
+                    [[unroll]] for (uint i = 0; i < tileRows; i++) {
+                        [[unroll]] for (uint j = 0; j < tileCols; j++) {
+                            dst[(invId.y * tileRows + j) * tensorDims.M + invId.x * tileCols + i] = dstLocal[i][j];
                         }
                     }
                 }
-
-                [[unroll]] for (uint32_t i = 0; i < tileRows; i++) {
-                    [[unroll]] for (uint32_t j = 0; j < tileCols; j++) {
-                        dst[(invId.y * tileRows + j) * 2DTensorDims.M + invId.x * tileCols + i] = dst[i][j];
-                    }
-                }
-
             )MatMulF32Body");
+            fprintf(stderr, "%s\n", mat_mul_f32_comp.c_str());
 
             vk::ShaderModule shader_module = {};
             {
