@@ -22,6 +22,8 @@ static vk::Device         device = {};
 
 static vk::PhysicalDeviceProperties gpu_props = {};
 static vk::PhysicalDeviceMemoryProperties gpu_mem_props = {};
+static std::vector<uint32_t> preferred_host_acs_mem_type_idxs;
+
 static uint64_t gpu_local_size = 0;
 
 static uint32_t compute_queue_idx = UINT32_MAX;
@@ -34,8 +36,6 @@ static vk::CommandPool transfer_cmd_pool = {};
 static vk::DescriptorPool descript_pool = {};
 
 static vk::PipelineCache pipeline_cache = {};
-
-static std::vector<uint32_t> preferred_host_acs_mem_type_idxs;
 
 static constexpr uint32_t max_tensors_per_op = 4;
 
@@ -96,7 +96,8 @@ void ggml_init_vulkan(void) {
                          .setApiVersion(VK_API_VERSION_1_1); // TODO, check loader version in build time?
 
     // No explicit layer required.
-    const uint32_t enabled_layer_count = 0;
+    const char * enabled_layers[] = { "VK_LAYER_KHRONOS_validation" };
+    const uint32_t enabled_layer_count = ARRAY_LEN(enabled_layers);
 
 #if defined(__APPLE__)
     const char * enabled_inst_exts[] = { "VK_KHR_portability_enumeration" };
@@ -110,7 +111,7 @@ void ggml_init_vulkan(void) {
                                .setPApplicationInfo(&app_info)
                                .setFlags(vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR)
                                .setEnabledLayerCount(enabled_layer_count)
-                               .setPpEnabledLayerNames(nullptr)
+                               .setPpEnabledLayerNames(enabled_layers)
                                .setEnabledExtensionCount(enabled_ext_count)
                                .setPpEnabledExtensionNames(enabled_inst_exts);
 
@@ -347,27 +348,26 @@ gpu_select_done:
     }
 }
 
-struct alignas(GGML_MEM_ALIGN) vk_host_buffer_private {
+struct vk_host_buffer_private {
     const uint64_t magic = 0xdeadbeef;
     bool is_gpu_mem = false;
     vk::MemoryPropertyFlags flags = {};
     vk::DeviceMemory gpu_mem = {};
     uint64_t data_offset = 0;
 };
-static_assert(sizeof(vk_host_buffer_private) % GGML_MEM_ALIGN == 0, "");
 
 static inline size_t calc_alloc_size(const size_t requested_size) {
+    static_assert(sizeof(vk_host_buffer_private) <= GGML_MEM_ALIGN, "");
     return requested_size + sizeof(vk_host_buffer_private) + static_cast<size_t>(GGML_MEM_ALIGN - 1);
 }
 
+template<bool check=true>
 static inline vk_host_buffer_private * get_vk_private(const void * data_ptr) {
     vk_host_buffer_private * ret = reinterpret_cast<vk_host_buffer_private *>(reinterpret_cast<uintptr_t>(data_ptr) - sizeof(vk_host_buffer_private));
-    GGML_ASSERT(ret->magic == 0xdeadbeef);
+    if (check) {
+        GGML_ASSERT(ret->magic == 0xdeadbeef);
+    }
     return ret;
-}
-
-static inline void * get_data_addr(vk_host_buffer_private * vk_private) {
-    return reinterpret_cast<void *>(reinterpret_cast<uint8_t *>(vk_private) + sizeof(vk_host_buffer_private));
 }
 
 static inline ggml_object * to_object(const ggml_tensor * tensor) {
@@ -381,6 +381,10 @@ static inline vk_host_buffer_private * get_tensor_vk_private(const ggml_tensor *
 }
 
 void * ggml_vk_host_malloc(size_t size) {
+    if (device == vk::Device{}) {
+        throw std::runtime_error("Vulkan device not initialized!");
+    }
+
     size = calc_alloc_size(size);
 
     void * addr = nullptr;
@@ -426,14 +430,14 @@ void * ggml_vk_host_malloc(size_t size) {
     }
 
     constexpr uintptr_t align_mask = GGML_MEM_ALIGN - 1u;
-    void * aligned_addr = reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(addr) + align_mask) & ~align_mask);
-    vk_host_buffer_private * vk_private = new (aligned_addr) vk_host_buffer_private{};
+    void * data_addr = reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(addr) + sizeof(vk_host_buffer_private) + align_mask) & ~align_mask);
+    vk_host_buffer_private * vk_private = new (get_vk_private<false>(data_addr)) vk_host_buffer_private{};
     vk_private->is_gpu_mem = gpu_mem != vk::DeviceMemory{};
     vk_private->flags = gpu_mem_flags;
     vk_private->gpu_mem = gpu_mem;
-    vk_private->data_offset = reinterpret_cast<uintptr_t>(get_data_addr(vk_private)) - reinterpret_cast<uintptr_t>(aligned_addr);
+    vk_private->data_offset = reinterpret_cast<uintptr_t>(data_addr) - reinterpret_cast<uintptr_t>(addr);
 
-    return get_data_addr(vk_private);
+    return data_addr;
 }
 
 void ggml_vk_host_free(void * ptr) {
@@ -597,6 +601,16 @@ static const KernelPipeline & get_pipeline(const KernelType kernel_type) {
             }
 
             {
+                const auto descrip_alloc_info = vk::DescriptorSetAllocateInfo()
+                    .setDescriptorPool(descript_pool)
+                    .setDescriptorSetCount(1)
+                    .setPSetLayouts(&mat_mul_f32_pipeline.descript_layout);
+
+                result = device.allocateDescriptorSets(&descrip_alloc_info, &mat_mul_f32_pipeline.descript_set);
+                GGML_ASSERT(result == vk::Result::eSuccess);
+            }
+
+            {
                 const auto push_const_info = vk::PushConstantRange()
                     .setOffset(0)
                     .setSize(sizeof(uint32_t) * 3)
@@ -653,16 +667,12 @@ struct AutoTensorBuffer {
         GGML_ASSERT(result == vk::Result::eSuccess);
 
         vk_host_buffer_private* vk_buffer_private = get_tensor_vk_private(tensor);
-        const vk::DeviceSize offset = reinterpret_cast<uint8_t*>(tensor->data) - reinterpret_cast<uint8_t*>(vk_buffer_private);
+        const vk::DeviceSize offset = vk_buffer_private->data_offset;
         device.bindBufferMemory(vk_buffer, vk_buffer_private->gpu_mem, offset);
     }
 
-    vk::WriteDescriptorSet write_descriptor() {
-        return vk::WriteDescriptorSet()
-            .setDescriptorType(vk::DescriptorType::eStorageBuffer)
-            .setDescriptorCount(1)
-            .setBufferInfo(vk::DescriptorBufferInfo()
-                .setBuffer(vk_buffer).setOffset(0).setRange(VK_WHOLE_SIZE));
+    vk::DescriptorBufferInfo write_descriptor() {
+        return vk::DescriptorBufferInfo().setBuffer(vk_buffer).setOffset(0).setRange(VK_WHOLE_SIZE);
     }
 
     ~AutoTensorBuffer() {
@@ -705,17 +715,27 @@ void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor *
     const bool prefer_device_local = (gpu_props.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) &&
         (to_object(src0)->size + to_object(src1)->size + to_object(dst)->size) < gpu_local_size;
 
+    AutoTensorBuffer<true> src0_buffer(src0);
+    AutoTensorBuffer<true> src1_buffer(src1);
+    AutoTensorBuffer<false> dst_buffer(dst);
+
     if (prefer_device_local) {
         throw std::runtime_error("Not implemented!");
     } else {
-        AutoTensorBuffer<true> src0_buffer(src0);
-        AutoTensorBuffer<true> src1_buffer(src1);
-        AutoTensorBuffer<false> dst_buffer(dst);
+        const vk::DescriptorBufferInfo buffer_infos [] = {
+            src0_buffer.write_descriptor(),
+            src1_buffer.write_descriptor(),
+            dst_buffer.write_descriptor(),
+        };
 
-        const vk::WriteDescriptorSet write_descripts[] = {
-            src0_buffer.write_descriptor().setDstSet(kernel_pipeline.descript_set).setDstBinding(0),
-            src1_buffer.write_descriptor().setDstSet(kernel_pipeline.descript_set).setDstBinding(1),
-            dst_buffer.write_descriptor().setDstSet(kernel_pipeline.descript_set).setDstBinding(2),
+        vk::WriteDescriptorSet write_descripts[ARRAY_LEN(buffer_infos)] = {};
+        for (uint32_t i = 0; i < ARRAY_LEN(write_descripts); i++) {
+            write_descripts[i] = vk::WriteDescriptorSet()
+                .setDescriptorType(vk::DescriptorType::eStorageBuffer)
+                .setDescriptorCount(1)
+                .setPBufferInfo(&buffer_infos[i])
+                .setDstBinding(i)
+                .setDstSet(kernel_pipeline.descript_set);
         };
         device.updateDescriptorSets(ARRAY_LEN(write_descripts), write_descripts, 0, nullptr);
 

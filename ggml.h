@@ -200,10 +200,14 @@
 #define GGML_MAX_OPT           4
 #define GGML_DEFAULT_N_THREADS 4
 
-#if UINTPTR_MAX == 0xFFFFFFFF
-    #define GGML_MEM_ALIGN 4
+#ifdef GGML_USE_VULKAN
+    #define GGML_MEM_ALIGN 0x100
 #else
-    #define GGML_MEM_ALIGN 16
+    #if UINTPTR_MAX == 0xFFFFFFFF
+        #define GGML_MEM_ALIGN 4
+    #else
+        #define GGML_MEM_ALIGN 16
+    #endif
 #endif
 
 #define GGML_ASSERT(x) \
@@ -340,7 +344,11 @@ extern "C" {
 
         struct ggml_object * next;
 
+#ifdef GGML_USE_VULKAN
+        char padding[232];
+#else
         char padding[8];
+#endif
     };
 
     static const size_t GGML_OBJECT_SIZE = sizeof(struct ggml_object);
@@ -379,7 +387,11 @@ extern "C" {
 
         char name[32];
 
+#ifdef GGML_USE_VULKAN
+        char padding[48];
+#else
         char padding[16];
+#endif
     };
 
     // computation graph
