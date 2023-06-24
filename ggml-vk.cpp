@@ -504,52 +504,66 @@ static const KernelPipeline & get_pipeline(const KernelType kernel_type) {
             )MatMulFp32Header") +
             "layout (local_size_x = " + std::to_string(mat_mul_f32_pipeline.local_size_x) + ", "
             "local_size_y = " + std::to_string(mat_mul_f32_pipeline.local_size_y) + ", local_size_z = 1) in; \n" +
-            "const uint tileRows = " + std::to_string(mat_mul_f32_pipeline.tile_rows_per_th) + ";\n" +
-            "const uint tileCols = " + std::to_string(mat_mul_f32_pipeline.tile_cols_per_th) + ";\n" +
+            "const uint tileXLen = " + std::to_string(mat_mul_f32_pipeline.tile_rows_per_th) + ";\n" +
+            "const uint tileYLen = " + std::to_string(mat_mul_f32_pipeline.tile_cols_per_th) + ";\n" +
             std::string(R"MatMulF32Body(
                 uvec2 invId = uvec2(gl_GlobalInvocationID.xy);
 
                 layout (push_constant, std430) uniform constants {
-                    uint M;
                     uint K;
+                    uint M;
                     uint N;
                 } tensorDims;
 
-                // src0 M x K
+                // src0 K x M  -- GGML specific layout, transposed
+                //             -- it makes tile-based mat mul less efficient
+                //             -- because row elements' cache locality are not utilized.
                 // src1 K x N
                 // dst  M x N
                 layout (set=0, binding=0) readonly buffer src0Buffer { float src0[]; };
                 layout (set=0, binding=1) readonly buffer src1Buffer { float src1[]; };
                 layout (set=0, binding=2) writeonly buffer dstBuffer { float dst[]; };
 
-                float src0Local[tileRows];
-                float dstLocal[tileRows][tileCols];
+                float src0Local[tileXLen];
+                float dstLocal[tileXLen][tileYLen];
 
                 void main() {
-                    [[unroll]] for (uint i = 0; i < tileRows; i++) {
-                        [[unroll]] for (uint j = 0; j < tileCols; j++) {
+                    // Each thread going to compute an entire tile
+                    [[unroll]] for (uint i = 0; i < tileXLen; i++) {
+                        [[unroll]] for (uint j = 0; j < tileYLen; j++) {
                             dstLocal[i][j] = 0;
                         }
                     }
 
+                    // Loop over mul dimension
                     [[unroll]] for (uint k = 0; k < tensorDims.K; k++) {
-                        [[unroll]] for (uint i = 0; i < tileRows; i++) {
-                            src0Local[i] = src0[(invId.y * tileRows + i) * tensorDims.M + tensorDims.K];
+                        uint src0X = k;
+
+                        // Load each tile col of src0 data into faster memory.
+                        [[unroll]] for (uint i = 0; i < tileXLen; i++) {
+                            uint src0Y = invId.x * tileXLen + i;
+                            src0Local[i] = src0[src0Y * tensorDims.K + src0X];
                         }
 
-                        float src1Local;
-                        [[unroll]] for (uint j = 0; j < tileCols; j++) {
-                            src1Local = src1[k * tensorDims.M + invId.x * tileCols + j];
+                        uint src1X = k;
+                        // Loop over tile col of src1 data.
+                        [[unroll]] for (uint j = 0; j < tileYLen; j++) {
+                            uint src1Y = invId.y * tileYLen + j;
+                            float src1Local = src1[src1Y * tensorDims.K + src1X];
 
-                            for (uint i = 0; i < tileRows; i++) {
+                            [[unroll]] for (uint i = 0; i < tileXLen; i++) {
                                 dstLocal[i][j] = src0Local[i] * src1Local + dstLocal[i][j];
                             }
                         }
                     }
 
-                    [[unroll]] for (uint i = 0; i < tileRows; i++) {
-                        [[unroll]] for (uint j = 0; j < tileCols; j++) {
-                            dst[(invId.y * tileRows + j) * tensorDims.M + invId.x * tileCols + i] = dstLocal[i][j];
+                    [[unroll]] for (uint j = 0; j < tileYLen; j++) {
+                        [[unroll]] for (uint i = 0; i < tileXLen; i++) {
+                            uint dstX = invId.x * tileXLen + i;
+                            uint dstY = invId.y * tileYLen + j;
+                            if (dstX < tensorDims.M && dstY < tensorDims.N) {
+                                dst[dstY * tensorDims.M + dstX] = dstLocal[i][j];
+                            }
                         }
                     }
                 }
@@ -667,7 +681,7 @@ struct AutoTensorBuffer {
         GGML_ASSERT(result == vk::Result::eSuccess);
 
         vk_host_buffer_private* vk_buffer_private = get_tensor_vk_private(tensor);
-        const vk::DeviceSize offset = vk_buffer_private->data_offset;
+        const vk::DeviceSize offset = vk_buffer_private->data_offset + to_object(tensor)->offs + sizeof(ggml_tensor);
         device.bindBufferMemory(vk_buffer, vk_buffer_private->gpu_mem, offset);
     }
 
@@ -752,9 +766,10 @@ void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor *
             uint32_t M;
             uint32_t N;
         } mat_mul_dims = {
-            .M=static_cast<uint32_t>(src0->ne[0]),
-            .N=static_cast<uint32_t>(src1->ne[1]),
-            .K=static_cast<uint32_t>(src0->ne[1]),
+            // GGML matrix layout always puts higher rank into the inner dimension
+            .K=static_cast<uint32_t>(src0->ne[0]),
+            .M=static_cast<uint32_t>(dst->ne[0]),
+            .N=static_cast<uint32_t>(dst->ne[1]),
         };
 
         cmdbuf.pushConstants(kernel_pipeline.pipeline_layout,
@@ -763,10 +778,10 @@ void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor *
                              sizeof(MatMulDims),
                              &mat_mul_dims);
 
-        const auto div_round_up = [] (uint32_t x, uint32_t y) { return (x + y - 1) / y; };
+        const auto div_round_up = [] (uint32_t x, uint32_t y) -> uint32_t { return (x + y - 1) / y; };
         cmdbuf.dispatch(
             div_round_up(dst->ne[0], kernel_pipeline.local_size_x * kernel_pipeline.tile_rows_per_th),
-            div_round_up(dst->ne[1], kernel_pipeline.local_size_x * kernel_pipeline.tile_cols_per_th),
+            div_round_up(dst->ne[1], kernel_pipeline.local_size_y * kernel_pipeline.tile_cols_per_th),
             1);
     }
     cmdbuf.end();
