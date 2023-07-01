@@ -186,7 +186,7 @@ int main(int argc, char ** argv)  {
 
     TENSOR_DUMP(gf.nodes[0]);
 
-    printf("\n------ Test 2 - Matrix Mult via Q4_0 code ------------------------------------------------------------------------------\n");
+    printf("\n------ Test 2 - Matrix Mult via F32 code ------------------------------------------------------------------------------\n");
 
     int32_t nelements = sizex*sizey;
     int32_t ne[2] = { sizex, sizey };
@@ -238,24 +238,24 @@ int main(int argc, char ** argv)  {
 
         long long int start = ggml_time_us();
         //printf("Running ggml_graph_compute\n");
-        ggml_graph_compute(ctx, &gf31);
+        ggml_graph_compute(ctx, &gf);
         long long int stop = ggml_time_us();
         long long int usec = stop-start;
         double gflops = (double)(flops_per_matrix)/usec/1000.0;
         gflops_sum += gflops;
         printf("%9i;%8i;%6i;%6i;%6i;%15lli;%18lli;%10.2f\n",
             i,
-            gf31.n_threads,
+            gf.n_threads,
             sizex, sizey, sizez, flops_per_matrix,
             usec,gflops);
 
 #ifdef VERBOSE_DEBUGGING
-        TENSOR_DUMP("res",gf31.nodes[0])
+        TENSOR_DUMP("res",gf.nodes[0])
 #endif
 
         // Check that the matrix multiplication result is in the right ballpark
         // We cannot use the exact value from the F32 multiplication because the quantizuation will be slightly different
-        float sum_of_Q4_result = tensor_sum_elements(gf31.nodes[0]);
+        float sum_of_Q4_result = tensor_sum_elements(gf.nodes[0]);
         float delta = abs(sum_of_Q4_result - sum_of_F32_reference);
         float allowed_delta = (sum_of_F32_reference) / 1000 / 1000; //  Let's accept an epsilon of 10^-6
 
