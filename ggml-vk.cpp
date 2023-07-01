@@ -39,6 +39,15 @@ static vk::PipelineCache pipeline_cache = {};
 
 static constexpr uint32_t max_tensors_per_op = 4;
 
+static struct {
+    uint32_t thread_group_size_x = 8;
+    uint32_t thread_group_size_y = 8;
+    uint32_t thread_group_size_z = 1;
+    uint32_t per_thread_tile_bytes_x = 32;
+    uint32_t per_thread_tile_bytes_y = 32;
+    uint32_t per_thread_tile_bytes_z = 1;
+} shader_params;
+
 static void init_host_acs_mem_preferences() {
     preferred_host_acs_mem_type_idxs.clear();
     for (uint32_t i = 0; i < gpu_mem_props.memoryTypeCount; i++) {
@@ -83,6 +92,28 @@ static void print_mem_type_preference() {
             static_cast<uint64_t>(heap.size),
             vk::to_string(heap.flags).c_str());
     }
+}
+
+static void init_shader_super_params() {
+    const char* s = nullptr;
+#define MAYBE_ASSIGN_ENV_SETTING(param, env)\
+    if ((s = std::getenv(env)) != nullptr) {    \
+        param = static_cast<decltype(param)>(std::stoi(s)); \
+    }
+        MAYBE_ASSIGN_ENV_SETTING(shader_params.thread_group_size_x, "GGML_VK_TH_GROUP_SIZE_X");
+        MAYBE_ASSIGN_ENV_SETTING(shader_params.thread_group_size_y, "GGML_VK_TH_GROUP_SIZE_Y");
+        MAYBE_ASSIGN_ENV_SETTING(shader_params.thread_group_size_z, "GGML_VK_TH_GROUP_SIZE_Z");
+        MAYBE_ASSIGN_ENV_SETTING(shader_params.per_thread_tile_bytes_x, "GGML_VK_TH_TILE_BYTES_X")
+        MAYBE_ASSIGN_ENV_SETTING(shader_params.per_thread_tile_bytes_y, "GGML_VK_TH_TILE_BYTES_Y");
+        MAYBE_ASSIGN_ENV_SETTING(shader_params.per_thread_tile_bytes_z, "GGML_VK_TH_TILE_BYTES_Z");
+#undef MAYBE_ASSIGN_ENV_SETTING
+
+    fprintf(stderr, "Thread group size X: %d\n", shader_params.thread_group_size_x);
+    fprintf(stderr, "Thread group size Y: %d\n", shader_params.thread_group_size_y);
+    fprintf(stderr, "Thread group size Z: %d\n", shader_params.thread_group_size_z);
+    fprintf(stderr, "Per thread tile bytes X: %d\n", shader_params.per_thread_tile_bytes_x);
+    fprintf(stderr, "Per thread tile bytes Y: %d\n", shader_params.per_thread_tile_bytes_y);
+    fprintf(stderr, "Per thread tile bytes Z: %d\n", shader_params.per_thread_tile_bytes_z);
 }
 
 void ggml_init_vulkan(void) {
@@ -346,6 +377,8 @@ gpu_select_done:
         const vk::Result result = device.createDescriptorPool(&descript_pool_info, nullptr, &descript_pool);
         GGML_ASSERT(result == vk::Result::eSuccess);
     }
+
+    init_shader_super_params();
 }
 
 struct vk_host_buffer_private {
@@ -480,10 +513,8 @@ struct KernelPipeline {
     vk::DescriptorSetLayout descript_layout = {};
     vk::DescriptorSet descript_set = {}; // Only 1 set is used. At most one cmd in flight.
     vk::Pipeline pipeline = {};
-    static constexpr uint32_t tile_rows_per_th = 8;
-    static constexpr uint32_t tile_cols_per_th = 8;
-    static constexpr uint32_t local_size_x = 8;
-    static constexpr uint32_t local_size_y = 8;
+    uint32_t tile_rows_per_th = 1;
+    uint32_t tile_cols_per_th = 1;
     bool valid = false;
 };
 
@@ -496,14 +527,23 @@ static const KernelPipeline & get_pipeline(const KernelType kernel_type) {
                 return mat_mul_f32_pipeline;
             }
 
+            mat_mul_f32_pipeline.tile_rows_per_th = shader_params.per_thread_tile_bytes_x / sizeof(float);
+            mat_mul_f32_pipeline.tile_cols_per_th = shader_params.per_thread_tile_bytes_y / sizeof(float);
+            fprintf(stderr, "Compiling F32 mat mul pipeline local group size %dx%d, tile size %dx%d\n",
+                shader_params.thread_group_size_x,
+                shader_params.thread_group_size_y,
+                mat_mul_f32_pipeline.tile_rows_per_th,
+                mat_mul_f32_pipeline.tile_cols_per_th);
+
+
             const std::string mat_mul_f32_comp = std::string(R"MatMulFp32Header(
                 #version 430
                 #extension GL_ARB_compute_shader : enable
                 #extension GL_EXT_control_flow_attributes : enable
 
             )MatMulFp32Header") +
-            "layout (local_size_x = " + std::to_string(mat_mul_f32_pipeline.local_size_x) + ", "
-            "local_size_y = " + std::to_string(mat_mul_f32_pipeline.local_size_y) + ", local_size_z = 1) in; \n" +
+            "layout (local_size_x = " + std::to_string(shader_params.thread_group_size_x) + ", "
+            "local_size_y = " + std::to_string(shader_params.thread_group_size_y) + ", local_size_z = 1) in; \n" +
             "const uint tileXLen = " + std::to_string(mat_mul_f32_pipeline.tile_rows_per_th) + ";\n" +
             "const uint tileYLen = " + std::to_string(mat_mul_f32_pipeline.tile_cols_per_th) + ";\n" +
             std::string(R"MatMulF32Body(
@@ -780,8 +820,8 @@ void ggml_vk_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor *
 
         const auto div_round_up = [] (uint32_t x, uint32_t y) -> uint32_t { return (x + y - 1) / y; };
         cmdbuf.dispatch(
-            div_round_up(dst->ne[0], kernel_pipeline.local_size_x * kernel_pipeline.tile_rows_per_th),
-            div_round_up(dst->ne[1], kernel_pipeline.local_size_y * kernel_pipeline.tile_cols_per_th),
+            div_round_up(dst->ne[0], shader_params.thread_group_size_x * kernel_pipeline.tile_rows_per_th),
+            div_round_up(dst->ne[1], shader_params.thread_group_size_y * kernel_pipeline.tile_cols_per_th),
             1);
     }
     cmdbuf.end();
